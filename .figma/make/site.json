@@ -1,0 +1,10 @@
+{
+  "description": "Connects displaced people with verified shelters, hosts, food, and healthcare while routing help requests and emergency alerts to human responders.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
