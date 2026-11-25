@@ -1,4 +1,5 @@
 import os
+import hashlib
 import secrets
 import sqlite3
 import time
@@ -7,21 +8,40 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from flask import Flask, g, jsonify, request, session
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.getenv("WARBRIDGE_DB", BASE_DIR / "warbridge.db"))
+APP_ENV = os.getenv("WARBRIDGE_ENV", "production").strip().lower()
 
 app = Flask(__name__)
+secret_key = os.getenv("SECRET_KEY")
+if not secret_key:
+    if APP_ENV == "development":
+        secret_key = "development-only-change-me"
+    else:
+        raise RuntimeError("SECRET_KEY must be configured outside explicit development mode")
+if APP_ENV not in ("development", "test") and os.getenv("HTTPS_ONLY") != "1":
+    raise RuntimeError("HTTPS_ONLY=1 is required outside development and test modes")
+if APP_ENV not in ("development", "test") and len(secret_key) < 32:
+    raise RuntimeError("SECRET_KEY must be at least 32 characters outside development and test modes")
+
 app.config.update(
-    SECRET_KEY=os.getenv("SECRET_KEY"),
+    SECRET_KEY=secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv("HTTPS_ONLY", "0") == "1",
+    SESSION_COOKIE_SECURE=APP_ENV not in ("development", "test") or os.getenv("HTTPS_ONLY") == "1",
 )
-if not app.config["SECRET_KEY"]:
-    app.config["SECRET_KEY"] = "development-only-change-me"
+try:
+    trusted_proxy_count = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
+except ValueError as error:
+    raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer") from error
+if trusted_proxy_count < 0:
+    raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer")
+if trusted_proxy_count:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=trusted_proxy_count)
 
 
 def utcnow():
@@ -30,9 +50,17 @@ def utcnow():
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
+        g.db = sqlite3.connect(DATABASE, timeout=10)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA busy_timeout = 10000")
     return g.db
+
+
+def ensure_column(db, table, column, definition):
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 @app.teardown_appcontext
@@ -40,6 +68,21 @@ def close_db(_error):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    )
+    if APP_ENV not in ("development", "test"):
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 def init_db():
@@ -81,11 +124,15 @@ def init_db():
             accommodation_id INTEGER REFERENCES accommodations(id),
             type TEXT NOT NULL,
             message TEXT,
+            requester_name TEXT,
             contact TEXT,
             location_text TEXT,
             status TEXT NOT NULL DEFAULT 'Pending',
             is_sos INTEGER NOT NULL DEFAULT 0,
             handled_by INTEGER REFERENCES users(id),
+            claimed_by INTEGER REFERENCES users(id),
+            claimed_at TEXT,
+            escalated_at TEXT,
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -96,6 +143,7 @@ def init_db():
             area TEXT NOT NULL,
             address TEXT,
             rooms INTEGER NOT NULL,
+            rooms_available INTEGER NOT NULL DEFAULT 0,
             women_only INTEGER NOT NULL DEFAULT 0,
             description TEXT,
             verified INTEGER NOT NULL DEFAULT 0,
@@ -158,8 +206,31 @@ def init_db():
             detail TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS rate_limit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            attempted_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_limit_events_scope_key_time
+            ON rate_limit_events(scope, key_hash, attempted_at);
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
         """
     )
+    current_version = db.execute("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations").fetchone()["version"]
+    if current_version < 1:
+        accommodation_columns = {row["name"] for row in db.execute("PRAGMA table_info(accommodations)")}
+        if "rooms_available" not in accommodation_columns:
+            ensure_column(db, "accommodations", "rooms_available", "INTEGER NOT NULL DEFAULT 0")
+            db.execute("UPDATE accommodations SET rooms_available=rooms")
+        ensure_column(db, "help_requests", "requester_name", "TEXT")
+        ensure_column(db, "help_requests", "claimed_by", "INTEGER REFERENCES users(id)")
+        ensure_column(db, "help_requests", "claimed_at", "TEXT")
+        ensure_column(db, "help_requests", "escalated_at", "TEXT")
+        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", (utcnow(),))
     db.commit()
 
     admin_email = os.getenv("WARBRIDGE_ADMIN_EMAIL")
@@ -221,7 +292,79 @@ def audit(actor_id, action, target_type=None, target_id=None, detail=None):
         "INSERT INTO audit_log(actor_id,action,target_type,target_id,detail,created_at) VALUES(?,?,?,?,?,?)",
         (actor_id, action, target_type, target_id, detail, utcnow()),
     )
-    get_db().commit()
+
+
+def audit_and_commit(db, actor_id, action, target_type=None, target_id=None, detail=None):
+    audit(actor_id, action, target_type, target_id, detail)
+    db.commit()
+
+
+def rate_limit_key(value):
+    return hashlib.sha256(f"{app.config['SECRET_KEY']}:{value}".encode()).hexdigest()
+
+
+def allow_rate_limited_attempt(scope, value, limit, window_seconds):
+    db = get_db()
+    key_hash = rate_limit_key(value)
+    now = time.time()
+    db.execute("BEGIN IMMEDIATE")
+    db.execute(
+        "DELETE FROM rate_limit_events WHERE scope=? AND key_hash=? AND attempted_at < ?",
+        (scope, key_hash, now - window_seconds),
+    )
+    count = db.execute(
+        "SELECT COUNT(*) AS count FROM rate_limit_events WHERE scope=? AND key_hash=?",
+        (scope, key_hash),
+    ).fetchone()["count"]
+    if count >= limit:
+        db.commit()
+        return False
+    db.execute(
+        "INSERT INTO rate_limit_events(scope,key_hash,attempted_at) VALUES(?,?,?)",
+        (scope, key_hash, now),
+    )
+    db.commit()
+    return True
+
+
+def clear_rate_limited_attempts(scope, value):
+    db = get_db()
+    db.execute(
+        "DELETE FROM rate_limit_events WHERE scope=? AND key_hash=?",
+        (scope, rate_limit_key(value)),
+    )
+    db.commit()
+
+
+def parse_expiry(value):
+    if value in (None, ""):
+        return None
+    try:
+        expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        return False
+    return expires.astimezone(timezone.utc).isoformat()
+
+
+def protected_request(row):
+    item = json_row(row)
+    if item["status"] != "Accepted":
+        item.pop("contact", None)
+        item.pop("location_text", None)
+    return item
+
+
+def protected_sos(row, include_private=False):
+    item = json_row(row)
+    if not include_private:
+        item.pop("requester_name", None)
+        item.pop("contact", None)
+        item.pop("location_text", None)
+    item["has_contact"] = bool(row["contact"])
+    item["has_location"] = bool(row["location_text"])
+    return item
 
 
 def json_row(row):
@@ -244,6 +387,17 @@ def public_user(user):
 @app.get("/api/csrf")
 def csrf():
     return jsonify({"csrfToken": session["csrf_token"]})
+
+
+@app.get("/api/health/live")
+def health_live():
+    return jsonify({"status": "ok"})
+
+
+@app.get("/api/health/ready")
+def health_ready():
+    get_db().execute("SELECT 1").fetchone()
+    return jsonify({"status": "ready"})
 
 
 @app.post("/api/auth/register")
@@ -281,26 +435,20 @@ def register():
     return jsonify({"user": public_user(user), "csrfToken": session["csrf_token"]})
 
 
-LOGIN_ATTEMPTS = {}
-
-
 @app.post("/api/auth/login")
 def login():
     denied = require_csrf()
     if denied:
         return denied
     ip = request.remote_addr or "unknown"
-    now = time.time()
-    record = LOGIN_ATTEMPTS.setdefault(ip, [])
-    record[:] = [timestamp for timestamp in record if now - timestamp < 300]
-    if len(record) >= 5:
+    if not allow_rate_limited_attempt("login", ip, 5, 300):
         return jsonify({"error": "Too many login attempts. Try again later."}), 429
     data = request.get_json(silent=True) or {}
     identity = str(data.get("identity", "")).strip().lower()
     role = str(data.get("role", "")).strip().upper()
     password = str(data.get("password", ""))
-    if role not in ("NGO", "ADMIN"):
-        return jsonify({"error": "Choose NGO or Administrator sign-in"}), 400
+    if role not in ("DISPLACED", "HOST", "NGO", "ADMIN"):
+        return jsonify({"error": "Choose a valid WarBridge account role"}), 400
     if not identity or not password:
         return jsonify({"error": "Name and password are required"}), 400
     users = get_db().execute(
@@ -312,10 +460,9 @@ def login():
     if len(matches) > 1:
         return jsonify({"error": "This name matches multiple accounts. Sign in with the account email instead."}), 409
     if not matches:
-        record.append(now)
         return jsonify({"error": "Invalid name or password"}), 401
     user = matches[0]
-    record.clear()
+    clear_rate_limited_attempts("login", ip)
     if user["blocked"]:
         return jsonify({"error": "Account blocked"}), 403
     session.clear()
@@ -345,7 +492,8 @@ def public_alerts():
     rows = get_db().execute(
         """SELECT a.*, u.name AS partner_name FROM alerts a
            JOIN users u ON u.id=a.ngo_id
-           WHERE a.blocked=0 AND (a.expires_at IS NULL OR a.expires_at > ?)
+           WHERE a.blocked=0 AND u.verified=1 AND u.blocked=0
+             AND (a.expires_at IS NULL OR a.expires_at > ?)
            ORDER BY a.created_at DESC LIMIT 3""",
         (now,),
     ).fetchall()
@@ -357,7 +505,7 @@ def public_shelters():
     city = request.args.get("city", "").strip()
     women_safe = request.args.get("women_safe") == "1"
     family_friendly = request.args.get("family_friendly") == "1"
-    where = ["s.blocked=0", "s.verified=1"]
+    where = ["s.blocked=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
     params = []
     if city:
         where.append("LOWER(s.city) LIKE LOWER(?)")
@@ -371,7 +519,8 @@ def public_shelters():
                    s.family_friendly,s.verified,s.updated_at,
                    COALESCE(ROUND(AVG(r.stars),1),0) AS rating,
                    COUNT(r.id) AS rating_count
-            FROM shelters s LEFT JOIN ratings r ON r.listing_type='shelter' AND r.listing_id=s.id
+            FROM shelters s JOIN users u ON u.id=s.ngo_id
+            LEFT JOIN ratings r ON r.listing_type='shelter' AND r.listing_id=s.id
             WHERE {' AND '.join(where)}
             GROUP BY s.id ORDER BY s.verified DESC,s.beds_available DESC,s.updated_at DESC""",
         params,
@@ -383,7 +532,7 @@ def public_shelters():
 def public_services():
     city = request.args.get("city", "").strip()
     category = request.args.get("category", "").strip()
-    where = ["blocked=0", "verified=1"]
+    where = ["s.blocked=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
     params = []
     if city:
         where.append("LOWER(city) LIKE LOWER(?)")
@@ -392,10 +541,29 @@ def public_services():
         where.append("LOWER(category)=LOWER(?)")
         params.append(category)
     rows = get_db().execute(
-        f"SELECT id,name,category,city,opening_hours,contact,updated_at FROM services WHERE {' AND '.join(where)} ORDER BY updated_at DESC",
+        f"""SELECT s.id,s.name,s.category,s.city,s.opening_hours,s.contact,s.updated_at
+            FROM services s JOIN users u ON u.id=s.ngo_id
+            WHERE {' AND '.join(where)} ORDER BY s.updated_at DESC""",
         params,
     ).fetchall()
     return jsonify({"services": [json_row(row) for row in rows]})
+
+
+@app.get("/api/public/accommodations")
+def public_accommodations():
+    city = request.args.get("city", "").strip()
+    where = ["a.blocked=0", "a.closed=0", "a.verified=1", "u.verified=1", "u.blocked=0", "a.rooms_available > 0"]
+    params = []
+    if city:
+        where.append("LOWER(a.city) LIKE LOWER(?)")
+        params.append(f"%{city}%")
+    rows = get_db().execute(
+        f"""SELECT a.id,a.city,a.area,a.rooms_available,a.women_only,a.description,a.updated_at
+            FROM accommodations a JOIN users u ON u.id=a.host_id
+            WHERE {' AND '.join(where)} ORDER BY a.updated_at DESC""",
+        params,
+    ).fetchall()
+    return jsonify({"accommodations": [json_row(row) for row in rows]})
 
 
 @app.post("/api/sos")
@@ -407,22 +575,137 @@ def create_sos():
     if data.get("website"):
         return jsonify({"ok": True})
     ip = request.remote_addr or "unknown"
-    key = ("sos", ip)
-    record = LOGIN_ATTEMPTS.setdefault(key, [])
-    now = time.time()
-    record[:] = [timestamp for timestamp in record if now - timestamp < 300]
-    if len(record) >= 3:
+    if not allow_rate_limited_attempt("sos", ip, 3, 300):
         return jsonify({"error": "Too many SOS submissions. Please call 112 if this is an emergency."}), 429
-    record.append(now)
     db = get_db()
     cur = db.execute(
-        """INSERT INTO help_requests(requester_id,type,message,contact,location_text,status,is_sos,updated_at,created_at)
-           VALUES(NULL,'SOS',?,?,?, 'Pending',1,?,?)""",
-        (str(data.get("message", ""))[:1000], str(data.get("phone", ""))[:40], str(data.get("location", ""))[:300], utcnow(), utcnow()),
+        """INSERT INTO help_requests(requester_id,type,message,requester_name,contact,location_text,status,is_sos,updated_at,created_at)
+           VALUES(NULL,'SOS',?,?,?,?, 'Pending',1,?,?)""",
+        (
+            str(data.get("message") or "")[:1000],
+            str(data.get("name") or "")[:120],
+            str(data.get("phone") or "")[:40],
+            str(data.get("location") or "")[:300],
+            utcnow(),
+            utcnow(),
+        ),
     )
-    db.commit()
-    audit(current_user()["id"] if current_user() else None, "sos_created", "help_request", cur.lastrowid)
-    return jsonify({"ok": True, "id": cur.lastrowid})
+    audit_and_commit(db, current_user()["id"] if current_user() else None, "sos_created", "help_request", cur.lastrowid)
+    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+
+
+@app.get("/api/sos/incoming")
+@role_required("NGO")
+def incoming_sos(user):
+    if not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    rows = get_db().execute(
+        """SELECT * FROM help_requests
+           WHERE is_sos=1 AND status IN ('Pending','Accepted','Escalated')
+             AND (claimed_by IS NULL OR claimed_by=?)
+           ORDER BY CASE status WHEN 'Escalated' THEN 0 ELSE 1 END, created_at ASC""",
+        (user["id"],),
+    ).fetchall()
+    private_rows = [row for row in rows if row["claimed_by"] == user["id"]]
+    if private_rows:
+        db = get_db()
+        for row in private_rows:
+            audit(user["id"], "sos_details_accessed", "help_request", row["id"])
+        db.commit()
+    return jsonify({
+        "requests": [
+            protected_sos(row, include_private=row["claimed_by"] == user["id"])
+            for row in rows
+        ]
+    })
+
+
+@app.get("/api/admin/sos")
+@role_required("ADMIN")
+def admin_sos(user):
+    rows = get_db().execute(
+        """SELECT * FROM help_requests
+           WHERE is_sos=1 AND status IN ('Pending','Accepted','Escalated')
+           ORDER BY CASE status WHEN 'Escalated' THEN 0 ELSE 1 END, created_at ASC"""
+    ).fetchall()
+    return jsonify({"requests": [protected_sos(row) for row in rows]})
+
+
+@app.post("/api/sos/<int:request_id>/claim")
+@role_required("NGO")
+def claim_sos(user, request_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    if not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute(
+        "SELECT id,status,claimed_by FROM help_requests WHERE id=? AND is_sos=1",
+        (request_id,),
+    ).fetchone()
+    if not row:
+        db.rollback()
+        return jsonify({"error": "SOS request not found"}), 404
+    if row["status"] not in ("Pending", "Escalated") or row["claimed_by"] is not None:
+        db.rollback()
+        return jsonify({"error": "SOS request is no longer available to claim"}), 409
+    now = utcnow()
+    updated = db.execute(
+        """UPDATE help_requests SET status='Accepted',claimed_by=?,claimed_at=?,handled_by=?,updated_at=?
+           WHERE id=? AND is_sos=1 AND status IN ('Pending','Escalated') AND claimed_by IS NULL""",
+        (user["id"], now, user["id"], now, request_id),
+    )
+    if updated.rowcount != 1:
+        db.rollback()
+        return jsonify({"error": "SOS request is no longer available to claim"}), 409
+    audit_and_commit(db, user["id"], "sos_claimed", "help_request", request_id)
+    return jsonify({"ok": True, "status": "Accepted"})
+
+
+@app.post("/api/sos/<int:request_id>/<action>")
+@role_required("NGO", "ADMIN")
+def update_sos(user, request_id, action):
+    denied = require_csrf()
+    if denied:
+        return denied
+    if action not in ("escalate", "resolve"):
+        return jsonify({"error": "Invalid action"}), 404
+    if user["role"] == "NGO" and not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute(
+        "SELECT * FROM help_requests WHERE id=? AND is_sos=1",
+        (request_id,),
+    ).fetchone()
+    if not row:
+        db.rollback()
+        return jsonify({"error": "SOS request not found"}), 404
+    if user["role"] == "NGO" and row["claimed_by"] != user["id"]:
+        db.rollback()
+        return jsonify({"error": "Only the NGO that claimed this SOS can update it"}), 403
+    if row["status"] not in ("Pending", "Accepted", "Escalated"):
+        db.rollback()
+        return jsonify({"error": "SOS request is already closed"}), 409
+    if action == "resolve" and row["status"] == "Pending":
+        db.rollback()
+        return jsonify({"error": "SOS request must be claimed before it can be resolved"}), 409
+    now = utcnow()
+    status = "Escalated" if action == "escalate" else "Resolved"
+    if action == "escalate":
+        db.execute(
+            "UPDATE help_requests SET status=?,escalated_at=?,updated_at=? WHERE id=?",
+            (status, now, now, request_id),
+        )
+    else:
+        db.execute(
+            "UPDATE help_requests SET status=?,updated_at=? WHERE id=?",
+            (status, now, request_id),
+        )
+    audit_and_commit(db, user["id"], f"sos_{action}d", "help_request", request_id)
+    return jsonify({"ok": True, "status": status})
 
 
 @app.post("/api/requests")
@@ -435,13 +718,23 @@ def create_request(user):
     request_type = str(data.get("type", "shelter")).strip().lower()
     shelter_id = data.get("shelter_id")
     accommodation_id = data.get("accommodation_id")
-    if not shelter_id and not accommodation_id:
+    if bool(shelter_id) == bool(accommodation_id):
         return jsonify({"error": "A shelter or accommodation is required"}), 400
+    if request_type not in ("shelter", "accommodation"):
+        return jsonify({"error": "Request type must be shelter or accommodation"}), 400
     db = get_db()
     if shelter_id:
-        shelter = db.execute("SELECT * FROM shelters WHERE id=?", (shelter_id,)).fetchone()
+        if request_type != "shelter" or not isinstance(shelter_id, int):
+            return jsonify({"error": "A valid shelter ID is required"}), 400
+        shelter = db.execute(
+            """SELECT s.* FROM shelters s JOIN users u ON u.id=s.ngo_id
+               WHERE s.id=? AND u.verified=1 AND u.blocked=0""",
+            (shelter_id,),
+        ).fetchone()
         if not shelter or shelter["blocked"] or not shelter["verified"]:
             return jsonify({"error": "Shelter is not available"}), 404
+        if shelter["beds_available"] < 1:
+            return jsonify({"error": "No beds are currently available"}), 409
         if shelter["women_safe"] and str(user["gender"]).lower() != "female":
             return jsonify({"error": "This listing is restricted to users who identified as female"}), 403
         duplicate = db.execute(
@@ -449,9 +742,17 @@ def create_request(user):
             (user["id"], shelter_id),
         ).fetchone()
     else:
-        accommodation = db.execute("SELECT * FROM accommodations WHERE id=?", (accommodation_id,)).fetchone()
-        if not accommodation or accommodation["blocked"] or not accommodation["verified"]:
+        if request_type != "accommodation" or not isinstance(accommodation_id, int):
+            return jsonify({"error": "A valid accommodation ID is required"}), 400
+        accommodation = db.execute(
+            """SELECT a.* FROM accommodations a JOIN users u ON u.id=a.host_id
+               WHERE a.id=? AND u.verified=1 AND u.blocked=0""",
+            (accommodation_id,),
+        ).fetchone()
+        if not accommodation or accommodation["blocked"] or not accommodation["verified"] or accommodation["closed"]:
             return jsonify({"error": "Accommodation is not available"}), 404
+        if accommodation["rooms_available"] < 1:
+            return jsonify({"error": "No rooms are currently available"}), 409
         if accommodation["women_only"] and str(user["gender"]).lower() != "female":
             return jsonify({"error": "This listing is restricted to users who identified as female"}), 403
         duplicate = db.execute(
@@ -466,8 +767,7 @@ def create_request(user):
         (user["id"], request_type, str(data.get("message", ""))[:1000],
          str(data.get("contact", ""))[:40], shelter_id, accommodation_id, utcnow(), utcnow()),
     )
-    db.commit()
-    audit(user["id"], "request_created", "help_request", cur.lastrowid)
+    audit_and_commit(db, user["id"], "request_created", "help_request", cur.lastrowid)
     return jsonify({"request": {"id": cur.lastrowid, "status": "Pending"}}), 201
 
 
@@ -502,42 +802,61 @@ def cancel_request(user, request_id):
     if denied:
         return denied
     db = get_db()
+    db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT * FROM help_requests WHERE id=?", (request_id,)).fetchone()
     if not row or row["requester_id"] != user["id"]:
+        db.rollback()
         return jsonify({"error": "Request not found"}), 404
     if row["status"] not in ("Pending", "Accepted"):
+        db.rollback()
         return jsonify({"error": "Request cannot be cancelled"}), 409
-    db.execute("UPDATE help_requests SET status='Cancelled',handled_by=?,updated_at=? WHERE id=?",
+    updated = db.execute("UPDATE help_requests SET status='Cancelled',handled_by=?,updated_at=? WHERE id=? AND status IN ('Pending','Accepted')",
                (user["id"], utcnow(), request_id))
-    restore_request_bed(db, row)
-    db.commit()
-    audit(user["id"], "request_cancelled", "help_request", request_id)
+    if updated.rowcount != 1:
+        db.rollback()
+        return jsonify({"error": "Request cannot be cancelled"}), 409
+    restore_request_capacity(db, row)
+    audit_and_commit(db, user["id"], "request_cancelled", "help_request", request_id)
     return jsonify({"ok": True})
 
 
 @app.get("/api/requests/incoming")
 @role_required("NGO", "HOST")
 def incoming_requests(user):
+    if not verified_required(user):
+        return jsonify({"error": "Partner verification required"}), 403
     db = get_db()
     if user["role"] == "NGO":
         rows = db.execute(
             """SELECT r.* FROM help_requests r JOIN shelters s ON s.id=r.shelter_id
-               WHERE s.ngo_id=? AND r.status IN ('Pending','Accepted') ORDER BY r.is_sos DESC,r.created_at ASC""",
+               WHERE s.ngo_id=? AND r.is_sos=0 AND r.status IN ('Pending','Accepted') ORDER BY r.created_at ASC""",
             (user["id"],),
         ).fetchall()
     else:
         rows = db.execute(
             """SELECT r.* FROM help_requests r JOIN accommodations a ON a.id=r.accommodation_id
-               WHERE a.host_id=? AND r.status IN ('Pending','Accepted') ORDER BY r.created_at ASC""",
+               WHERE a.host_id=? AND r.is_sos=0 AND r.status IN ('Pending','Accepted') ORDER BY r.created_at ASC""",
             (user["id"],),
         ).fetchall()
-    return jsonify({"requests": [json_row(row) for row in rows]})
+    accepted_rows = [row for row in rows if row["status"] == "Accepted"]
+    if accepted_rows:
+        for row in accepted_rows:
+            audit(user["id"], "request_details_accessed", "help_request", row["id"])
+        db.commit()
+    return jsonify({"requests": [protected_request(row) for row in rows]})
 
 
-def restore_request_bed(db, row):
+def restore_request_capacity(db, row):
     if row["status"] == "Accepted" and row["shelter_id"]:
         db.execute("UPDATE shelters SET beds_available=beds_available+1,updated_at=? WHERE id=?",
                    (utcnow(), row["shelter_id"]))
+    elif row["status"] == "Accepted" and row["accommodation_id"]:
+        db.execute(
+            """UPDATE accommodations
+               SET rooms_available=MIN(rooms,rooms_available+1),updated_at=?
+               WHERE id=?""",
+            (utcnow(), row["accommodation_id"]),
+        )
 
 
 @app.post("/api/requests/<int:request_id>/<action>")
@@ -551,37 +870,59 @@ def handle_request(user, request_id, action):
     if action not in ("accept", "reject", "complete"):
         return jsonify({"error": "Invalid action"}), 404
     db = get_db()
+    db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT * FROM help_requests WHERE id=?", (request_id,)).fetchone()
     if not row:
+        db.rollback()
         return jsonify({"error": "Request not found"}), 404
+    if row["is_sos"]:
+        db.rollback()
+        return jsonify({"error": "SOS requests use the SOS claim and resolution workflow"}), 409
     if user["role"] == "NGO" and row["shelter_id"]:
         owned = db.execute("SELECT 1 FROM shelters WHERE id=? AND ngo_id=?", (row["shelter_id"], user["id"])).fetchone()
         if not owned:
+            db.rollback()
             return jsonify({"error": "Forbidden"}), 403
-    if user["role"] == "HOST" and row["accommodation_id"]:
+    elif user["role"] == "HOST" and row["accommodation_id"]:
         owned = db.execute("SELECT 1 FROM accommodations WHERE id=? AND host_id=?", (row["accommodation_id"], user["id"])).fetchone()
         if not owned:
+            db.rollback()
             return jsonify({"error": "Forbidden"}), 403
+    else:
+        db.rollback()
+        return jsonify({"error": "Forbidden"}), 403
     valid = (
         action == "accept" and row["status"] == "Pending"
         or action == "reject" and row["status"] == "Pending"
         or action == "complete" and row["status"] == "Accepted"
     )
     if not valid:
+        db.rollback()
         return jsonify({"error": "Invalid status transition"}), 409
     if action == "accept" and row["shelter_id"]:
-        shelter = db.execute("SELECT beds_available FROM shelters WHERE id=?", (row["shelter_id"],)).fetchone()
-        if not shelter or shelter["beds_available"] < 1:
+        capacity = db.execute(
+            """UPDATE shelters SET beds_available=beds_available-1,updated_at=?
+               WHERE id=? AND beds_available > 0 AND verified=1 AND blocked=0""",
+            (utcnow(), row["shelter_id"]),
+        )
+        if capacity.rowcount != 1:
+            db.rollback()
             return jsonify({"error": "No beds available"}), 409
-        db.execute("UPDATE shelters SET beds_available=beds_available-1,updated_at=? WHERE id=?",
-                   (utcnow(), row["shelter_id"]))
+    elif action == "accept" and row["accommodation_id"]:
+        capacity = db.execute(
+            """UPDATE accommodations SET rooms_available=rooms_available-1,updated_at=?
+               WHERE id=? AND rooms_available > 0 AND verified=1 AND blocked=0 AND closed=0""",
+            (utcnow(), row["accommodation_id"]),
+        )
+        if capacity.rowcount != 1:
+            db.rollback()
+            return jsonify({"error": "No rooms available"}), 409
     status = {"accept": "Accepted", "reject": "Rejected", "complete": "Completed"}[action]
     db.execute("UPDATE help_requests SET status=?,handled_by=?,updated_at=? WHERE id=?",
                (status, user["id"], utcnow(), request_id))
     if action == "complete":
-        restore_request_bed(db, dict(row))
-    db.commit()
-    audit(user["id"], f"request_{action}", "help_request", request_id)
+        restore_request_capacity(db, row)
+    audit_and_commit(db, user["id"], f"request_{action}", "help_request", request_id)
     return jsonify({"ok": True, "status": status})
 
 
@@ -604,13 +945,12 @@ def create_shelter(user):
     db = get_db()
     cur = db.execute(
         """INSERT INTO shelters(ngo_id,name,city,area,address,phone,beds_available,women_safe,family_friendly,verified,blocked,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,1,0,?)""",
+           VALUES(?,?,?,?,?,?,?,?,?,0,0,?)""",
         (user["id"], name, city, area, str(data.get("address", ""))[:300],
          str(data.get("phone", ""))[:40], beds, int(bool(data.get("women_safe"))),
          int(bool(data.get("family_friendly"))), utcnow()),
     )
-    db.commit()
-    audit(user["id"], "shelter_created", "shelter", cur.lastrowid)
+    audit_and_commit(db, user["id"], "shelter_created", "shelter", cur.lastrowid)
     return jsonify({"id": cur.lastrowid}), 201
 
 
@@ -630,14 +970,14 @@ def create_accommodation(user):
         return jsonify({"error": "rooms must be a number"}), 400
     if not city or not area or rooms < 1:
         return jsonify({"error": "City, area and at least one room are required"}), 400
-    cur = get_db().execute(
-        """INSERT INTO accommodations(host_id,city,area,address,rooms,women_only,description,verified,blocked,closed,updated_at)
-           VALUES(?,?,?,?,?,?,?,1,0,0,?)""",
-        (user["id"], city, area, str(data.get("address", ""))[:300], rooms,
+    db = get_db()
+    cur = db.execute(
+        """INSERT INTO accommodations(host_id,city,area,address,rooms,rooms_available,women_only,description,verified,blocked,closed,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,0,0,0,?)""",
+        (user["id"], city, area, str(data.get("address", ""))[:300], rooms, rooms,
          int(bool(data.get("women_only"))), str(data.get("description", ""))[:1000], utcnow()),
     )
-    get_db().commit()
-    audit(user["id"], "accommodation_created", "accommodation", cur.lastrowid)
+    audit_and_commit(db, user["id"], "accommodation_created", "accommodation", cur.lastrowid)
     return jsonify({"id": cur.lastrowid}), 201
 
 
@@ -654,13 +994,17 @@ def create_alert(user):
     alert_type = str(data.get("type", "Warning")).strip()
     if not title or not message or alert_type not in ("Food", "Shelter", "Medical", "Warning"):
         return jsonify({"error": "Title, message and a valid alert type are required"}), 400
-    expires_at = data.get("expires_at")
-    cur = get_db().execute(
+    expires_at = parse_expiry(data.get("expires_at"))
+    if expires_at is False:
+        return jsonify({"error": "expires_at must be a valid ISO-8601 timestamp with a timezone"}), 400
+    if expires_at and datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+        return jsonify({"error": "expires_at must be in the future"}), 400
+    db = get_db()
+    cur = db.execute(
         "INSERT INTO alerts(ngo_id,title,message,type,expires_at,blocked,updated_at,created_at) VALUES(?,?,?,?,?,0,?,?)",
         (user["id"], title[:200], message[:2000], alert_type, expires_at, utcnow(), utcnow()),
     )
-    get_db().commit()
-    audit(user["id"], "alert_created", "alert", cur.lastrowid)
+    audit_and_commit(db, user["id"], "alert_created", "alert", cur.lastrowid)
     return jsonify({"id": cur.lastrowid}), 201
 
 
@@ -679,15 +1023,19 @@ def create_report(user):
     if len(reason) < 5:
         return jsonify({"error": "Reason must be at least 5 characters"}), 400
     db = get_db()
+    table = {"shelter": "shelters", "accommodation": "accommodations", "service": "services"}[listing_type]
+    target = db.execute(f"SELECT id,blocked FROM {table} WHERE id=?", (listing_id,)).fetchone()
+    if not target or target["blocked"]:
+        return jsonify({"error": "Listing does not exist or is not reportable"}), 404
     try:
         cur = db.execute(
             "INSERT INTO reports(reporter_id,listing_type,listing_id,reason,status,updated_at,created_at) VALUES(?,?,?,?, 'Open', ?, ?)",
             (user["id"], listing_type, listing_id, reason[:1000], utcnow(), utcnow()),
         )
-        db.commit()
     except sqlite3.IntegrityError:
+        db.rollback()
         return jsonify({"error": "You have already reported this listing"}), 409
-    audit(user["id"], "listing_reported", listing_type, listing_id)
+    audit_and_commit(db, user["id"], "listing_reported", listing_type, listing_id)
     return jsonify({"id": cur.lastrowid}), 201
 
 
@@ -706,6 +1054,8 @@ def create_rating(user):
         return jsonify({"error": "stars must be a number"}), 400
     if listing_type not in ("shelter", "accommodation", "service") or not isinstance(listing_id, int) or not 1 <= stars <= 5:
         return jsonify({"error": "Valid listing and 1 to 5 stars are required"}), 400
+    if listing_type == "service":
+        return jsonify({"error": "Service ratings are unavailable until completed service use can be verified"}), 403
     db = get_db()
     if listing_type == "shelter":
         completed = db.execute(
@@ -717,8 +1067,6 @@ def create_rating(user):
             "SELECT id FROM help_requests WHERE requester_id=? AND accommodation_id=? AND status='Completed'",
             (user["id"], listing_id),
         ).fetchone()
-    else:
-        completed = True
     if not completed:
         return jsonify({"error": "Ratings require a completed request"}), 403
     db.execute(
@@ -727,8 +1075,7 @@ def create_rating(user):
            ON CONFLICT(user_id,listing_type,listing_id) DO UPDATE SET stars=excluded.stars,comment=excluded.comment,updated_at=excluded.updated_at""",
         (user["id"], listing_type, listing_id, stars, str(data.get("comment", ""))[:1000], utcnow()),
     )
-    db.commit()
-    audit(user["id"], "rating_submitted", listing_type, listing_id)
+    audit_and_commit(db, user["id"], "rating_submitted", listing_type, listing_id)
     return jsonify({"ok": True})
 
 
@@ -739,6 +1086,75 @@ def admin_verifications(user):
         "SELECT id,name,email,role,verified,created_at FROM users WHERE role IN ('HOST','NGO') AND verified=0 AND blocked=0 ORDER BY created_at DESC"
     ).fetchall()
     return jsonify({"users": [json_row(row) for row in rows]})
+
+
+def admin_listing_rows(condition):
+    specifications = (
+        ("shelter", "shelters", "name", "ngo_id"),
+        ("accommodation", "accommodations", "city", "host_id"),
+        ("service", "services", "name", "ngo_id"),
+    )
+    results = []
+    for listing_type, table, label_column, owner_column in specifications:
+        rows = get_db().execute(
+            f"""SELECT l.id,l.{label_column} AS label,l.updated_at,u.name AS owner_name
+                FROM {table} l JOIN users u ON u.id=l.{owner_column}
+                WHERE {condition} ORDER BY l.updated_at DESC"""
+        ).fetchall()
+        results.extend(
+            {**json_row(row), "listing_type": listing_type}
+            for row in rows
+        )
+    return results
+
+
+@app.get("/api/admin/listings/pending")
+@role_required("ADMIN")
+def pending_listings(user):
+    return jsonify({"listings": admin_listing_rows("l.verified=0 AND l.blocked=0")})
+
+
+@app.get("/api/admin/listings/blocked")
+@role_required("ADMIN")
+def blocked_listings(user):
+    return jsonify({"listings": admin_listing_rows("l.blocked=1")})
+
+
+@app.get("/api/admin/reports")
+@role_required("ADMIN")
+def admin_reports(user):
+    rows = get_db().execute(
+        "SELECT id,reporter_id,listing_type,listing_id,reason,status,updated_at,created_at FROM reports WHERE status='Open' ORDER BY created_at ASC"
+    ).fetchall()
+    return jsonify({"reports": [json_row(row) for row in rows]})
+
+
+@app.post("/api/admin/listings/<listing_type>/<int:listing_id>/<action>")
+@role_required("ADMIN")
+def moderate_listing(user, listing_type, listing_id, action):
+    denied = require_csrf()
+    if denied:
+        return denied
+    tables = {"shelter": "shelters", "accommodation": "accommodations", "service": "services"}
+    if listing_type not in tables or action not in ("approve", "block", "unblock"):
+        return jsonify({"error": "Invalid listing moderation action"}), 404
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    table = tables[listing_type]
+    target = db.execute(f"SELECT id FROM {table} WHERE id=?", (listing_id,)).fetchone()
+    if not target:
+        db.rollback()
+        return jsonify({"error": "Listing not found"}), 404
+    if action == "approve":
+        db.execute(f"UPDATE {table} SET verified=1,updated_at=? WHERE id=?", (utcnow(), listing_id))
+    else:
+        db.execute(
+            f"UPDATE {table} SET blocked=?,updated_at=? WHERE id=?",
+            (1 if action == "block" else 0, utcnow(), listing_id),
+        )
+    audit_action = f"listing_{action}d" if action != "unblock" else "listing_unblocked"
+    audit_and_commit(db, user["id"], audit_action, listing_type, listing_id)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/admin/users/<int:user_id>/verify")
@@ -752,8 +1168,7 @@ def verify_user(user, user_id):
     if not target:
         return jsonify({"error": "Partner not found"}), 404
     db.execute("UPDATE users SET verified=1 WHERE id=?", (user_id,))
-    db.commit()
-    audit(user["id"], "partner_verified", "user", user_id)
+    audit_and_commit(db, user["id"], "partner_verified", "user", user_id)
     return jsonify({"ok": True})
 
 
@@ -771,8 +1186,7 @@ def reject_user(user, user_id):
     if not target:
         return jsonify({"error": "Pending partner not found"}), 404
     db.execute("UPDATE users SET blocked=1 WHERE id=?", (user_id,))
-    db.commit()
-    audit(user["id"], "partner_rejected", "user", user_id)
+    audit_and_commit(db, user["id"], "partner_rejected", "user", user_id)
     return jsonify({"ok": True})
 
 
@@ -790,15 +1204,18 @@ def handle_report(user, report_id, action):
         return jsonify({"error": "Report not found"}), 404
     table = {"shelter": "shelters", "accommodation": "accommodations", "service": "services"}[report["listing_type"]]
     if action in ("block", "unblock"):
-        db.execute(f"UPDATE {table} SET blocked=? WHERE id=?", (1 if action == "block" else 0, report["listing_id"]))
+        target = db.execute(f"SELECT id FROM {table} WHERE id=?", (report["listing_id"],)).fetchone()
+        if not target:
+            db.rollback()
+            return jsonify({"error": "Reported listing no longer exists"}), 404
+        db.execute(f"UPDATE {table} SET blocked=?,updated_at=? WHERE id=?", (1 if action == "block" else 0, utcnow(), report["listing_id"]))
         if action == "block":
             db.execute("UPDATE reports SET status='Closed',admin_id=?,updated_at=? WHERE listing_type=? AND listing_id=?",
                        (user["id"], utcnow(), report["listing_type"], report["listing_id"]))
     else:
         db.execute("UPDATE reports SET status='Dismissed',admin_id=?,updated_at=? WHERE id=?",
                    (user["id"], utcnow(), report_id))
-    db.commit()
-    audit(user["id"], f"listing_{action}", report["listing_type"], report["listing_id"])
+    audit_and_commit(db, user["id"], f"listing_{action}", report["listing_type"], report["listing_id"])
     return jsonify({"ok": True})
 
 
@@ -810,4 +1227,6 @@ def audit_log(user):
 
 
 if __name__ == "__main__":
+    if APP_ENV != "development":
+        raise RuntimeError("The Flask development server is disabled outside WARBRIDGE_ENV=development")
     app.run(host="127.0.0.1", port=5000, debug=False)
