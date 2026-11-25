@@ -1,25 +1,53 @@
-# WarBridge — visual prototype
+# WarBridge
 
-A responsive React + Vite recreation of the supplied four-panel WarBridge reference, with a locally stored, generated night-camp background and violet, green, red, and blue role themes.
+A responsive React + Vite frontend with a Flask + SQLite backend implementing the WarBridge workflow.
 
-## Preview interactions
+## Run locally
 
-- Browse and filter example shelters and explore services and emergency helplines.
-- Add demo shelter requests and cancel them.
-- Accept sample requests in the NGO panel.
-- Publish session-only alerts and view them through the public Alerts dialog.
-- Review and approve or reject sample partners; block or dismiss a sample report.
-- Explore demo SOS, reporting, and completed-stay rating dialogs.
+```bash
+pnpm install
+pnpm dev
+```
 
-All examples are fictional. Changes live in React memory and reset on reload. The top navigation switches between a full-size Find Help cover and My Support (displaced user), Partner Hub (NGO), and Trust & Safety (admin) pages. They are demo views, not authenticated or access-controlled pages.
+In a second terminal:
+
+```bash
+python -m pip install -r backend_requirements.txt
+python app.py
+```
+
+Vite proxies `/api` requests to `http://127.0.0.1:5000`. Set a private `SECRET_KEY` before starting the backend.
+
+Create the first administrator account with:
+
+```bash
+python create_admin.py
+```
+
+The script asks for a username, email, and password and stores only a password hash. Sign-in accepts the NGO or administrator name and password (email can also be used). The selected role must match the database account. An NGO registration option is available from the sign-in form; newly registered NGOs remain read-only until approved by an administrator. Public listings remain empty until partners add real information.
+
+```bash
+set SECRET_KEY=replace-with-a-random-secret
+python app.py
+```
+
+NGO accounts can also be created with `POST /api/auth/register` using role `NGO`; new accounts require administrator verification before write access.
+
+## API areas
+
+- `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`
+- `GET /api/public/shelters`, `GET /api/public/services`, `GET /api/public/alerts`
+- `POST /api/sos`, `POST /api/requests`
+- NGO/host request handling, shelter/accommodation creation, verified-partner actions
+- Admin verification, report decisions, and audit log
+
+Mutating API requests require the CSRF token from `GET /api/csrf`.
 
 ## Safety and implementation boundaries
 
-This is **not** the Flask + SQLite production system described in the workflow specification. There is no backend, real authentication, database, permanent audit history, document verification, message delivery, or actual NGO routing. Demo SOS submissions do not alert anyone. For immediate assistance in India, call **112**, **181** (women's helpline), or **1098** (child helpline).
+This implementation is not a production verification system. Before real deployment, complete external identity/document checks, HTTPS deployment, persistent operational logging and backups, native Arabic/Hindi review, and a security review of the deployed environment. An SOS submission is a database request only and does not guarantee a response.
 
-Production work must implement server-enforced authorization and ownership, administrator-controlled verification, CSRF protection, password hashing, secure cookies and secrets, rate limiting, private address/contact release, transactional capacity management, valid request transitions, reporting and rating constraints, alert expiry, and durable audit records before this can safely handle real people or data.
-
-The app cannot determine identity or intent. NGOs, hosts, and shelters must make access decisions and screen people in person. Women-only eligibility is self-declared, not identity verification. Alerts are in-app only, not SMS or push. Listing freshness depends on partner updates. SQLite suits a demo or pilot; deployment requires a backup and audit plan and consideration of PostgreSQL. Arabic and Hindi translations require native review; this prototype is English-only.
+The app cannot determine identity or intent. NGOs, hosts, and shelters must make access decisions and screen people in person. Women-only eligibility is self-declared, not identity verification. Alerts are in-app only, not SMS or push. Listing freshness depends on partner updates. SQLite suits local development; a real deployment should consider PostgreSQL and a documented audit and backup plan.
 
 ## Development
 
