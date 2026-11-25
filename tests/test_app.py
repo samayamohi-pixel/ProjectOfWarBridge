@@ -5,6 +5,8 @@ import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 
 fd, db_path = tempfile.mkstemp()
@@ -13,7 +15,7 @@ os.environ["WARBRIDGE_DB"] = db_path
 os.environ["SECRET_KEY"] = "test-secret"
 os.environ["WARBRIDGE_ENV"] = "test"
 
-from app import app, get_db, utcnow
+from app import app, get_db, normalize_origin, utcnow
 from werkzeug.security import generate_password_hash
 
 
@@ -59,6 +61,33 @@ class WarBridgeApiTests(unittest.TestCase):
     def test_public_resources_are_available(self):
         self.assertEqual(self.client.get("/api/public/alerts").status_code, 200)
         self.assertEqual(self.client.get("/api/public/shelters").status_code, 200)
+
+    def test_preview_security_headers_use_explicit_embedding_allowlists(self):
+        with patch("app.FRAME_ANCESTORS", ("'self'", "https://preview.example")), patch(
+            "app.ALLOWED_CORS_ORIGINS", ("https://preview.example",)
+        ):
+            response = self.client.options(
+                "/api/csrf",
+                headers={
+                    "Origin": "https://preview.example",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://preview.example")
+        self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("frame-ancestors 'self' https://preview.example", response.headers["Content-Security-Policy"])
+        self.assertNotIn("X-Frame-Options", response.headers)
+
+    def test_deployment_origin_allowlists_reject_wildcards_and_http(self):
+        self.assertEqual(
+            normalize_origin("HTTPS://Preview.Example:443/", "FRAME_ANCESTORS"),
+            "https://preview.example",
+        )
+        with self.assertRaises(RuntimeError):
+            normalize_origin("https://*.example", "FRAME_ANCESTORS")
+        with patch("app.APP_ENV", "production"):
+            with self.assertRaises(RuntimeError):
+                normalize_origin("http://preview.example", "CORS_ALLOWED_ORIGINS")
 
     def test_register_login_and_logout(self):
         result = self.client.post(
@@ -175,6 +204,35 @@ class WarBridgeApiTests(unittest.TestCase):
             self.client.post(f"/api/sos/{result.get_json()['id']}/claim", headers=self.csrf).status_code,
             403,
         )
+
+    def test_admin_sos_exposes_and_audits_details_only_after_escalation(self):
+        created = self.client.post(
+            "/api/sos",
+            headers=self.csrf,
+            json={"name": "Escalated Caller", "phone": "555-0199", "location": "Private place"},
+        )
+        request_id = created.get_json()["id"]
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+
+        pending = self.client.get("/api/admin/sos").get_json()["requests"]
+        pending_row = next(item for item in pending if item["id"] == request_id)
+        self.assertNotIn("contact", pending_row)
+        self.assertNotIn("location_text", pending_row)
+
+        escalated = self.client.post(f"/api/sos/{request_id}/escalate", headers=self.csrf)
+        self.assertEqual(escalated.status_code, 200)
+        result = self.client.get("/api/admin/sos").get_json()["requests"]
+        escalated_row = next(item for item in result if item["id"] == request_id)
+        self.assertEqual(escalated_row["contact"], "555-0199")
+        self.assertEqual(escalated_row["location_text"], "Private place")
+        with app.app_context():
+            audited = get_db().execute(
+                """SELECT 1 FROM audit_log
+                   WHERE action='sos_details_accessed' AND target_id=? AND actor_id=?""",
+                (request_id, admin_id),
+            ).fetchone()
+        self.assertIsNotNone(audited)
 
     def test_pending_request_details_are_hidden_until_acceptance(self):
         ngo_id = self.create_user("NGO")
@@ -298,6 +356,29 @@ class WarBridgeApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 403)
 
+    def test_completed_shelter_request_can_be_rated_and_read_back(self):
+        ngo_id = self.create_user("NGO")
+        shelter_id = self.create_shelter(ngo_id)
+        displaced_id = self.create_user("DISPLACED")
+        with app.app_context():
+            get_db().execute(
+                """INSERT INTO help_requests(requester_id,shelter_id,type,status,updated_at,created_at)
+                   VALUES(?,?,'shelter','Completed',?,?)""",
+                (displaced_id, shelter_id, utcnow(), utcnow()),
+            )
+            get_db().commit()
+        self.authenticate(displaced_id)
+        submitted = self.client.post(
+            "/api/ratings",
+            headers=self.csrf,
+            json={"listing_type": "shelter", "listing_id": shelter_id, "stars": 5, "comment": "Helpful staff"},
+        )
+        self.assertEqual(submitted.status_code, 200)
+        rating = self.client.get("/api/ratings/mine").get_json()["ratings"][0]
+        self.assertEqual(rating["listing_id"], shelter_id)
+        self.assertEqual(rating["stars"], 5)
+        self.assertEqual(rating["comment"], "Helpful staff")
+
     def test_listing_requires_admin_approval_and_reports_require_a_target(self):
         ngo_id = self.create_user("NGO")
         with app.app_context():
@@ -329,6 +410,146 @@ class WarBridgeApiTests(unittest.TestCase):
             json={"listing_type": "shelter", "listing_id": 999999, "reason": "Not a real listing"},
         )
         self.assertEqual(invalid_report.status_code, 404)
+
+    def test_ngo_can_create_edit_close_and_reopen_services(self):
+        ngo_id = self.create_user("NGO")
+        self.authenticate(ngo_id)
+        created = self.client.post(
+            "/api/services",
+            headers=self.csrf,
+            json={
+                "name": "Community Kitchen",
+                "category": "Food",
+                "city": "Test City",
+                "opening_hours": "10:00-14:00",
+                "contact": "555-0166",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        service_id = created.get_json()["id"]
+
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        approved = self.client.post(
+            f"/api/admin/listings/service/{service_id}/approve",
+            headers=self.csrf,
+        )
+        self.assertEqual(approved.status_code, 200)
+
+        self.authenticate(ngo_id)
+        updated = self.client.patch(
+            f"/api/listings/service/{service_id}",
+            headers=self.csrf,
+            json={"name": "Updated Kitchen", "category": "Healthcare"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        visible = self.client.get("/api/public/services").get_json()["services"]
+        self.assertEqual(next(item for item in visible if item["id"] == service_id)["name"], "Updated Kitchen")
+
+        closed = self.client.post(
+            f"/api/listings/service/{service_id}/close",
+            headers=self.csrf,
+        )
+        self.assertEqual(closed.status_code, 200)
+        visible_ids = [item["id"] for item in self.client.get("/api/public/services").get_json()["services"]]
+        self.assertNotIn(service_id, visible_ids)
+        reopened = self.client.post(
+            f"/api/listings/service/{service_id}/reopen",
+            headers=self.csrf,
+        )
+        self.assertEqual(reopened.status_code, 200)
+        visible_ids = [item["id"] for item in self.client.get("/api/public/services").get_json()["services"]]
+        self.assertIn(service_id, visible_ids)
+
+    def test_shelter_owner_can_edit_and_close_public_listing(self):
+        ngo_id = self.create_user("NGO")
+        shelter_id = self.create_shelter(ngo_id)
+        self.authenticate(ngo_id)
+        updated = self.client.patch(
+            f"/api/listings/shelter/{shelter_id}",
+            headers=self.csrf,
+            json={"name": "Renamed shelter", "beds_available": 4},
+        )
+        self.assertEqual(updated.status_code, 200)
+        displaced_id = self.create_user("DISPLACED")
+        self.authenticate(displaced_id)
+        pending = self.client.post(
+            "/api/requests",
+            headers=self.csrf,
+            json={"type": "shelter", "shelter_id": shelter_id},
+        )
+        self.assertEqual(pending.status_code, 201)
+        self.authenticate(ngo_id)
+        closed = self.client.post(
+            f"/api/listings/shelter/{shelter_id}/close",
+            headers=self.csrf,
+        )
+        self.assertEqual(closed.status_code, 200)
+        public_ids = [item["id"] for item in self.client.get("/api/public/shelters").get_json()["shelters"]]
+        self.assertNotIn(shelter_id, public_ids)
+        blocked_accept = self.client.post(
+            f"/api/requests/{pending.get_json()['request']['id']}/accept",
+            headers=self.csrf,
+        )
+        self.assertEqual(blocked_accept.status_code, 409)
+        self.authenticate(displaced_id)
+        closed_request = self.client.post(
+            "/api/requests",
+            headers=self.csrf,
+            json={"type": "shelter", "shelter_id": shelter_id},
+        )
+        self.assertEqual(closed_request.status_code, 404)
+        self.authenticate(ngo_id)
+        reopened = self.client.post(
+            f"/api/listings/shelter/{shelter_id}/reopen",
+            headers=self.csrf,
+        )
+        self.assertEqual(reopened.status_code, 200)
+        public_shelters = self.client.get("/api/public/shelters").get_json()["shelters"]
+        self.assertEqual(next(item for item in public_shelters if item["id"] == shelter_id)["name"], "Renamed shelter")
+        other_ngo = self.create_user("NGO")
+        self.authenticate(other_ngo)
+        forbidden = self.client.patch(
+            f"/api/listings/shelter/{shelter_id}",
+            headers=self.csrf,
+            json={"name": "Not the owner"},
+        )
+        self.assertEqual(forbidden.status_code, 404)
+
+    def test_alerts_can_be_updated_and_archived(self):
+        ngo_id = self.create_user("NGO")
+        self.authenticate(ngo_id)
+        future_expiry = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        created = self.client.post(
+            "/api/alerts",
+            headers=self.csrf,
+            json={
+                "title": "Food distribution",
+                "message": "A meal service is open",
+                "type": "Food",
+                "expires_at": future_expiry,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        alert_id = created.get_json()["id"]
+
+        updated = self.client.patch(
+            f"/api/alerts/{alert_id}",
+            headers=self.csrf,
+            json={"type": "Medical", "title": "Clinic hours"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        public_alert = next(
+            item for item in self.client.get("/api/public/alerts").get_json()["alerts"]
+            if item["id"] == alert_id
+        )
+        self.assertEqual(public_alert["type"], "Medical")
+        self.assertEqual(public_alert["title"], "Clinic hours")
+
+        archived = self.client.post(f"/api/alerts/{alert_id}/archive", headers=self.csrf)
+        self.assertEqual(archived.status_code, 200)
+        public_ids = [item["id"] for item in self.client.get("/api/public/alerts").get_json()["alerts"]]
+        self.assertNotIn(alert_id, public_ids)
 
 
 if __name__ == "__main__":

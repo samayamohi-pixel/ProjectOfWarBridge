@@ -43,7 +43,7 @@ const views: { id: View; label: string }[] = [
   { id: 'host', label: 'Host Hub' },
   { id: 'admin', label: 'Trust & Safety' },
 ]
-type RequestItem = { id: number; title: string; city: string; time: string; icon: IconName; accepted: boolean; urgent?: boolean; sos?: boolean; status?: string; contact?: string | null; requester_name?: string | null; location_text?: string | null }
+type RequestItem = { id: number; title: string; city: string; time: string; icon: IconName; accepted: boolean; urgent?: boolean; sos?: boolean; status?: string; contact?: string | null; requester_name?: string | null; location_text?: string | null; listing_type?: 'shelter' | 'accommodation'; listing_id?: number }
 type AuthUser = { id: number; name: string; email: string; role: 'DISPLACED' | 'HOST' | 'NGO' | 'ADMIN'; verified: boolean }
 type AuthRole = AuthUser['role']
 type VerificationItem = { id: number; name: string; role: string; time: string; created_at?: string }
@@ -77,6 +77,36 @@ type ApiAccommodation = {
   description: string | null
   updated_at: string
 }
+type ApiAlert = { id: number; title: string; message: string; type: string; expires_at: string | null; partner_name: string }
+type ManagedAlert = { id: number; title: string; message: string; type: string; expires_at: string | null; archived: number }
+type OwnedListing = {
+  id: number
+  listing_type: 'shelter' | 'accommodation' | 'service'
+  name?: string
+  category?: string
+  city: string
+  area?: string
+  address?: string
+  phone?: string
+  beds_available?: number
+  rooms?: number
+  rooms_available?: number
+  women_safe?: number
+  family_friendly?: number
+  women_only?: number
+  description?: string
+  opening_hours?: string
+  contact?: string
+  verified: number
+  blocked: number
+  closed: number
+}
+type ApiRating = { listing_type: 'shelter' | 'accommodation'; listing_id: number; stars: number; comment: string | null }
+const localDateTimeInput = (value: string | null) => {
+  if (!value) return ''
+  const date = new Date(value)
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+}
 
 export default function App() {
   const [view, setView] = useState<View>('home')
@@ -86,7 +116,13 @@ export default function App() {
   const [verifications, setVerifications] = useState<VerificationItem[]>([])
   const [adminTab, setAdminTab] = useState('Pending Verifications')
   const [alertText, setAlertText] = useState('')
-  const [alerts, setAlerts] = useState<string[]>([])
+  const [alertTitle, setAlertTitle] = useState('')
+  const [alertType, setAlertType] = useState('Warning')
+  const [alertExpiresAt, setAlertExpiresAt] = useState('')
+  const [alerts, setAlerts] = useState<ApiAlert[]>([])
+  const [managedAlerts, setManagedAlerts] = useState<ManagedAlert[]>([])
+  const [ownedListings, setOwnedListings] = useState<OwnedListing[]>([])
+  const [ratings, setRatings] = useState<ApiRating[]>([])
   const [apiShelters, setApiShelters] = useState<ApiShelter[]>([])
   const [apiAccommodations, setApiAccommodations] = useState<ApiAccommodation[]>([])
   const [apiServices, setApiServices] = useState<ApiService[]>([])
@@ -106,6 +142,12 @@ export default function App() {
   const [listingArea, setListingArea] = useState('')
   const [listingAddress, setListingAddress] = useState('')
   const [listingCapacity, setListingCapacity] = useState('1')
+  const [serviceName, setServiceName] = useState('')
+  const [serviceCategory, setServiceCategory] = useState('Food')
+  const [serviceCity, setServiceCity] = useState('')
+  const [serviceAddress, setServiceAddress] = useState('')
+  const [serviceHours, setServiceHours] = useState('')
+  const [serviceContact, setServiceContact] = useState('')
   const [authError, setAuthError] = useState('')
   const [authBusy, setAuthBusy] = useState(false)
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
@@ -148,7 +190,7 @@ export default function App() {
       void Promise.all([
         api.get<{ users: VerificationItem[] }>('/api/admin/verifications'),
         api.get<{ audit: AuditEntry[] }>('/api/admin/audit'),
-        api.get<{ requests: { id: number; status: string; created_at: string }[] }>('/api/admin/sos'),
+        api.get<{ requests: { id: number; status: string; created_at: string; contact?: string | null; location_text?: string | null; requester_name?: string | null }[] }>('/api/admin/sos'),
         api.get<{ reports: { id: number; listing_type: string; listing_id: number; reason: string }[] }>('/api/admin/reports'),
         api.get<{ listings: { id: number; listing_type: string; label: string; owner_name: string }[] }>('/api/admin/listings/pending'),
         api.get<{ listings: { id: number; listing_type: string; label: string; owner_name: string }[] }>('/api/admin/listings/blocked'),
@@ -161,13 +203,16 @@ export default function App() {
         setAdminSos(sosResult.requests.map(item => ({
           id: item.id,
           title: 'Emergency request',
-          city: 'Private details available only to the assigned NGO',
+          city: item.status === 'Escalated' ? item.location_text || 'Location not provided' : 'Private details available after escalation',
           time: new Date(item.created_at).toLocaleString(),
           icon: 'alert',
-          accepted: item.status !== 'Pending',
+          accepted: item.status === 'Escalated',
           urgent: true,
           sos: true,
           status: item.status,
+          contact: item.contact,
+          requester_name: item.requester_name,
+          location_text: item.location_text,
         })))
         setAdminReports(reportsResult.reports)
         setPendingListings(pendingResult.listings)
@@ -177,8 +222,13 @@ export default function App() {
       void Promise.all([
         api.get<{ requests: { id: number; type: string; location_text?: string | null; created_at: string; status: string }[] }>('/api/requests/incoming'),
         api.get<{ requests: { id: number; status: string; location_text?: string | null; contact?: string | null; requester_name?: string | null; created_at: string; claimed_by?: number | null }[] }>('/api/sos/incoming'),
-      ]).then(([requestResult, sosResult]) => setRequests([
-        ...requestResult.requests.map(item => ({
+        api.get<{ listings: OwnedListing[] }>('/api/listings/mine'),
+        api.get<{ alerts: ManagedAlert[] }>('/api/alerts/mine'),
+      ]).then(([requestResult, sosResult, listingsResult, alertsResult]) => {
+        setOwnedListings(listingsResult.listings)
+        setManagedAlerts(alertsResult.alerts)
+        setRequests([
+          ...requestResult.requests.map(item => ({
           id: item.id,
           title: `${item.type} request`,
           city: item.location_text || 'Location shared after acceptance',
@@ -201,11 +251,16 @@ export default function App() {
           requester_name: item.requester_name,
           location_text: item.location_text,
         })),
-      ]))
+        ])
+      })
         .catch(error => notify(error instanceof Error ? error.message : 'Could not load incoming requests.'))
     } else if (user.role === 'HOST') {
-      void api.get<{ requests: { id: number; type: string; location_text?: string | null; created_at: string; status: string }[] }>('/api/requests/incoming')
-        .then(result => setRequests(result.requests.map(item => ({
+      void Promise.all([
+        api.get<{ requests: { id: number; type: string; location_text?: string | null; created_at: string; status: string }[] }>('/api/requests/incoming'),
+        api.get<{ listings: OwnedListing[] }>('/api/listings/mine'),
+      ]).then(([result, listingsResult]) => {
+        setOwnedListings(listingsResult.listings)
+        setRequests(result.requests.map(item => ({
           id: item.id,
           title: `${item.type} request`,
           city: item.location_text || 'Location shared after acceptance',
@@ -213,11 +268,16 @@ export default function App() {
           icon: 'home',
           accepted: item.status === 'Accepted',
           status: item.status,
-        }))))
+        })))
+      })
         .catch(error => notify(error instanceof Error ? error.message : 'Could not load incoming requests.'))
     } else {
-      void api.get<{ requests: { id: number; type: string; status: string; created_at: string; shelter_name?: string; shelter_area?: string }[] }>('/api/requests/mine')
-        .then(result => setRequests(result.requests.map(item => ({
+      void Promise.all([
+        api.get<{ requests: { id: number; type: string; status: string; created_at: string; shelter_id: number | null; accommodation_id: number | null; shelter_name?: string; shelter_area?: string }[] }>('/api/requests/mine'),
+        api.get<{ ratings: ApiRating[] }>('/api/ratings/mine'),
+      ]).then(([result, ratingsResult]) => {
+        setRatings(ratingsResult.ratings)
+        setRequests(result.requests.map(item => ({
           id: item.id,
           title: `${item.type} request`,
           city: item.shelter_name || item.shelter_area || 'Your support request',
@@ -225,7 +285,10 @@ export default function App() {
           icon: 'bed',
           accepted: item.status === 'Accepted',
           status: item.status,
-        }))))
+          listing_type: item.shelter_id ? 'shelter' : item.accommodation_id ? 'accommodation' : undefined,
+          listing_id: item.shelter_id || item.accommodation_id || undefined,
+        })))
+      })
         .catch(error => notify(error instanceof Error ? error.message : 'Could not load your requests.'))
     }
   }
@@ -243,12 +306,12 @@ export default function App() {
     void Promise.all([
       api.get<{ shelters: ApiShelter[] }>('/api/public/shelters'),
       api.get<{ accommodations: ApiAccommodation[] }>('/api/public/accommodations'),
-      api.get<{ alerts: { id: number; title: string; message: string; partner_name: string }[] }>('/api/public/alerts'),
+      api.get<{ alerts: ApiAlert[] }>('/api/public/alerts'),
       api.get<{ services: ApiService[] }>('/api/public/services'),
     ]).then(([shelterResponse, accommodationResponse, alertResponse, serviceResponse]) => {
       setApiShelters(shelterResponse.shelters)
       setApiAccommodations(accommodationResponse.accommodations)
-      setAlerts(alertResponse.alerts.map(alert => alert.message))
+      setAlerts(alertResponse.alerts)
       setApiServices(serviceResponse.services)
     }).catch(() => {
       notify('Could not load public listings. Check that the backend is running.')
@@ -277,6 +340,7 @@ export default function App() {
     void api.post(path).then(() => {
       if (authUser) loadRoleData(authUser)
       notify(`Request ${action === 'cancel' ? 'cancelled' : action === 'complete' ? 'completed' : 'rejected'}.`)
+      setModal(null)
     }).catch(error => notify(error instanceof Error ? error.message : `Could not ${action} this request.`))
   }
   const claimSos = (id: number) => {
@@ -367,19 +431,130 @@ export default function App() {
       setListingAddress('')
       setListingCapacity('1')
       notify('Listing submitted for administrator review.')
+      if (authUser) loadRoleData(authUser)
     })
     .catch(error => notify(error instanceof Error ? error.message : 'Could not submit the listing.'))
   }
+  const createService = (event: FormEvent) => {
+    event.preventDefault()
+    void api.post('/api/services', {
+      name: serviceName,
+      category: serviceCategory,
+      city: serviceCity,
+      opening_hours: serviceHours,
+      contact: serviceContact,
+      address: serviceAddress,
+    }).then(() => {
+      setServiceName('')
+      setServiceHours('')
+      setServiceContact('')
+      setServiceCity('')
+      setServiceAddress('')
+      notify('Service submitted for administrator review.')
+      if (authUser) loadRoleData(authUser)
+    }).catch(error => notify(error instanceof Error ? error.message : 'Could not submit the service.'))
+  }
+  const updateOwnedListing = (event: FormEvent<HTMLFormElement>, listing: OwnedListing) => {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const payload: Record<string, unknown> = {
+      city: form.get('city'),
+      address: form.get('address'),
+    }
+    if (listing.listing_type === 'shelter') {
+      Object.assign(payload, {
+        name: form.get('name'),
+        area: form.get('area'),
+        phone: form.get('phone'),
+        beds_available: Number(form.get('beds_available')),
+        women_safe: form.get('women_safe') === 'on',
+        family_friendly: form.get('family_friendly') === 'on',
+      })
+    } else if (listing.listing_type === 'accommodation') {
+      Object.assign(payload, {
+        area: form.get('area'),
+        rooms: Number(form.get('rooms')),
+        women_only: form.get('women_only') === 'on',
+        description: form.get('description'),
+      })
+    } else {
+      Object.assign(payload, {
+        name: form.get('name'),
+        category: form.get('category'),
+        opening_hours: form.get('opening_hours'),
+        contact: form.get('contact'),
+      })
+    }
+    void api.patch(`/api/listings/${listing.listing_type}/${listing.id}`, payload)
+      .then(() => {
+        if (authUser) loadRoleData(authUser)
+        notify('Listing updated.')
+      })
+      .catch(error => notify(error instanceof Error ? error.message : 'Could not update the listing.'))
+  }
+  const changeListingStatus = (listing: OwnedListing) => {
+    const action = listing.closed ? 'reopen' : 'close'
+    void api.post(`/api/listings/${listing.listing_type}/${listing.id}/${action}`)
+      .then(() => {
+        if (authUser) loadRoleData(authUser)
+        notify(`Listing ${action === 'close' ? 'closed' : 'reopened'}.`)
+      })
+      .catch(error => notify(error instanceof Error ? error.message : 'Could not change listing status.'))
+  }
   const postAlert = (event: FormEvent) => {
     event.preventDefault()
-    if (!alertText.trim()) return
-    void api.post('/api/alerts', { title: alertText.trim().slice(0, 200), message: alertText.trim(), type: 'Warning' })
+    if (!alertTitle.trim() || !alertText.trim()) return
+    void api.post('/api/alerts', {
+      title: alertTitle.trim(),
+      message: alertText.trim(),
+      type: alertType,
+      expires_at: alertExpiresAt ? new Date(alertExpiresAt).toISOString() : null,
+    })
       .then(() => {
-        setAlerts(items => [alertText.trim(), ...items])
+        setAlertTitle('')
         setAlertText('')
-        notify('Community alert published.')
+        setAlertExpiresAt('')
+        notify('Community alert posted.')
+        if (authUser) loadRoleData(authUser)
+        void api.get<{ alerts: ApiAlert[] }>('/api/public/alerts').then(result => setAlerts(result.alerts))
       })
-      .catch(error => notify(error instanceof Error ? error.message : 'Sign in as a verified NGO to publish alerts.'))
+      .catch(error => notify(error instanceof Error ? error.message : 'Could not post this alert.'))
+  }
+  const updateAlert = (event: FormEvent<HTMLFormElement>, alert: ManagedAlert) => {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const expiresValue = String(form.get('expires_at') || '')
+    void api.patch(`/api/alerts/${alert.id}`, {
+      title: form.get('title'),
+      message: form.get('message'),
+      type: form.get('type'),
+      expires_at: expiresValue ? new Date(expiresValue).toISOString() : null,
+    }).then(() => {
+      if (authUser) loadRoleData(authUser)
+      void api.get<{ alerts: ApiAlert[] }>('/api/public/alerts').then(result => setAlerts(result.alerts))
+      notify('Alert updated.')
+    }).catch(error => notify(error instanceof Error ? error.message : 'Could not update the alert.'))
+  }
+  const archiveAlert = (alert: ManagedAlert) => {
+    void api.post(`/api/alerts/${alert.id}/archive`).then(() => {
+      if (authUser) loadRoleData(authUser)
+      void api.get<{ alerts: ApiAlert[] }>('/api/public/alerts').then(result => setAlerts(result.alerts))
+      notify('Alert archived.')
+    }).catch(error => notify(error instanceof Error ? error.message : 'Could not archive this alert.'))
+  }
+  const submitRating = (event: FormEvent<HTMLFormElement>, item: RequestItem) => {
+    event.preventDefault()
+    if (!item.listing_type || !item.listing_id) return
+    const form = new FormData(event.currentTarget)
+    void api.post('/api/ratings', {
+      listing_type: item.listing_type,
+      listing_id: item.listing_id,
+      stars: Number(form.get('stars')),
+      comment: form.get('comment'),
+    }).then(() => {
+      notify('Your rating was saved.')
+      if (authUser) loadRoleData(authUser)
+    }).catch(error => notify(error instanceof Error ? error.message : 'Could not submit your rating.'))
   }
   const navAction = (label: string) => {
     const map: Record<string, Modal> = { 'My Requests': 'requests', 'Help Requests': 'requests', 'Safety Helplines': 'helplines', Ratings: 'ratings', Reports: 'reports', Settings: 'settings', Shelters: 'shelters', Accommodations: 'accommodations', Services: 'services', Alerts: 'alerts', Verification: 'verification', 'Audit Log': 'audit', 'SOS Queue': 'sos-queue' }
@@ -423,9 +598,46 @@ export default function App() {
       <Sidebar role={authUser?.role === 'HOST' ? 'host' : 'ngo'} items={authUser?.role === 'HOST' ? [['home', 'Dashboard'], ['requests', 'Help Requests'], ['home', 'Accommodations'], ['settings', 'Settings']] : [['home', 'Dashboard'], ['home', 'Help Requests'], ['alert', 'SOS Queue'], ['bed', 'Shelters'], ['medical', 'Services'], ['megaphone', 'Alerts'], ['report', 'Reports'], ['settings', 'Settings']]}/>
       <div className="dashboard-main ngo-main"><div className="topbar"><span className="workspace-label">PARTNER WORKSPACE</span><Profile name={authUser?.name || 'Partner'} initial={(authUser?.name || 'P').slice(0, 1).toUpperCase()}/></div><div className="welcome"><div><h2>{authUser?.role === 'HOST' ? 'Host Dashboard' : 'NGO Dashboard'}</h2><p>Provide help. Make a difference.</p></div></div>
         <div className="stats-grid ngo-stats"><div className="stat"><span className="stat-icon violet"><Icon name="home" size={31}/></span><div><strong>{authUser?.role === 'HOST' ? apiAccommodations.length : apiShelters.length}</strong><small>{authUser?.role === 'HOST' ? 'Public stays' : 'Public shelters'}</small></div></div><div className="stat"><span className="stat-icon lime"><Icon name="people" size={31}/></span><div><strong>{requests.filter(request => request.accepted && !request.sos).length}</strong><small>Accepted requests</small></div></div><div className="stat"><span className="stat-icon danger"><Icon name="alert" size={31}/></span><div><strong>{requests.filter(request => request.sos && !request.accepted).length}</strong><small>Unclaimed SOS</small></div></div></div>
-        <div className="ngo-middle"><div className="surface incoming"><div className="section-heading"><h3>Incoming Help Requests</h3><button className="text-link" onClick={() => open(authUser?.role === 'HOST' ? 'requests' : 'sos-queue')}>View all <Icon name="arrow" size={12}/></button></div><div className="request-list">{requests.length ? requests.map(request => <div className="request-row" key={`${request.sos ? 'sos' : 'request'}-${request.id}`}><span className={`request-icon ${request.urgent ? 'urgent' : ''}`}>{request.urgent ? 'SOS' : <Icon name={request.icon} size={28}/>}</span><div className="request-info"><strong>{request.title}{request.urgent && <i/>}</strong><small>{request.city} · {request.status || request.time}</small></div><button className="outline-button" onClick={() => { setSelectedRequest(request); open('request-detail') }}>View</button>{request.sos ? <button className={`accept-button ${request.accepted ? 'accepted' : ''}`} disabled={request.accepted} onClick={() => claimSos(request.id)}>{request.accepted ? 'Claimed' : 'Claim SOS'}</button> : request.status === 'Pending' ? <><button className="reject-button" onClick={() => updateRequest(request.id, 'reject')}>Reject</button><button className="accept-button" onClick={() => accept(request.id)}>Accept</button></> : request.status === 'Accepted' ? <button className="accept-button" onClick={() => updateRequest(request.id, 'complete')}>Complete</button> : <span className="verified-tag">{request.status}</span>}</div>) : <p className="empty-state">No incoming requests.</p>}</div></div>
-          {authUser?.role === 'HOST' || authUser?.role === 'NGO' ? <form className="surface post-alert" onSubmit={createPartnerListing}><h3>{authUser.role === 'HOST' ? 'List accommodation' : 'List a shelter'}</h3><div className="modal-form"><label>City<input required value={listingCity} onChange={event => setListingCity(event.target.value)}/></label><label>Area<input required value={listingArea} onChange={event => setListingArea(event.target.value)}/></label><label>Address <span>(private until accepted)</span><input value={listingAddress} onChange={event => setListingAddress(event.target.value)}/></label><label>{authUser.role === 'HOST' ? 'Rooms available' : 'Beds available'}<input required min="1" type="number" value={listingCapacity} onChange={event => setListingCapacity(event.target.value)}/></label><button className="accept-button" type="submit" disabled={!authUser.verified}>Submit for review</button>{!authUser.verified && <small>Administrator verification is required before listing.</small>}</div></form> : null}</div>
-        {authUser?.role === 'NGO' && <form className="surface post-alert" onSubmit={postAlert}><h3>Post an Alert</h3><div className="alert-hint"><Icon name="megaphone" size={23}/><p>Share important updates<br/>with the community.</p></div><label className="sr-only" htmlFor="alert-message">Alert message</label><textarea id="alert-message" required maxLength={300} value={alertText} onChange={event => setAlertText(event.target.value)} placeholder="Type your message..."/><button className="accept-button" type="submit" disabled={!authUser.verified}>Post Alert</button>{!authUser.verified && <small>Administrator verification is required to post alerts.</small>}</form>}
+        <div className="ngo-middle"><div className="surface incoming"><div className="section-heading"><h3>Incoming Help Requests</h3><button className="text-link" onClick={() => open('requests')}>View all <Icon name="arrow" size={12}/></button></div><div className="request-list">{requests.length ? requests.map(request => <div className="request-row" key={`${request.sos ? 'sos' : 'request'}-${request.id}`}><span className={`request-icon ${request.urgent ? 'urgent' : ''}`}>{request.urgent ? 'SOS' : <Icon name={request.icon} size={28}/>}</span><div className="request-info"><strong>{request.title}{request.urgent && <i/>}</strong><small>{request.city} · {request.status || request.time}</small></div><button className="outline-button" onClick={() => { setSelectedRequest(request); open('request-detail') }}>View</button>{request.sos ? <button className={`accept-button ${request.accepted ? 'accepted' : ''}`} disabled={request.accepted} onClick={() => claimSos(request.id)}>{request.accepted ? 'Claimed' : 'Claim SOS'}</button> : request.status === 'Pending' ? <><button className="reject-button" onClick={() => updateRequest(request.id, 'reject')}>Reject</button><button className="accept-button" onClick={() => accept(request.id)}>Accept</button></> : request.status === 'Accepted' ? <button className="accept-button" onClick={() => updateRequest(request.id, 'complete')}>Complete</button> : <span className="verified-tag">{request.status}</span>}</div>) : <p className="empty-state">No incoming requests.</p>}</div></div>
+          {authUser?.role === 'HOST' || authUser?.role === 'NGO' ? <form className="surface post-alert" onSubmit={createPartnerListing}><h3>{authUser.role === 'HOST' ? 'List accommodation' : 'List a shelter'}</h3><div className="modal-form"><label>City<input required value={listingCity} onChange={event => setListingCity(event.target.value)}/></label><label>Area<input required value={listingArea} onChange={event => setListingArea(event.target.value)}/></label><label>Address <span>(private until accepted)</span><input value={listingAddress} onChange={event => setListingAddress(event.target.value)}/></label><label>{authUser.role === 'HOST' ? 'Rooms available' : 'Beds available'}<input required min="1" type="number" value={listingCapacity} onChange={event => setListingCapacity(event.target.value)}/></label><button className="accept-button" type="submit" disabled={!authUser.verified}>Submit for review</button>{!authUser.verified && <small>Administrator verification is required before listing.</small>}</div></form> : null}
+          {authUser?.role === 'NGO' && <>
+            <form className="surface post-alert" onSubmit={createService}>
+              <h3>List a food or healthcare service</h3>
+              <div className="modal-form">
+                <label>Service name<input required value={serviceName} onChange={event => setServiceName(event.target.value)}/></label>
+                <label>Category<select value={serviceCategory} onChange={event => setServiceCategory(event.target.value)}><option>Food</option><option>Healthcare</option><option>Medical</option><option>Legal</option><option>Transport</option><option>Other</option></select></label>
+                <label>City<input required value={serviceCity} onChange={event => setServiceCity(event.target.value)}/></label>
+                <label>Opening hours<input value={serviceHours} onChange={event => setServiceHours(event.target.value)}/></label>
+                <label>Contact<input value={serviceContact} onChange={event => setServiceContact(event.target.value)}/></label>
+                <label>Address<input value={serviceAddress} onChange={event => setServiceAddress(event.target.value)}/></label>
+                <button className="accept-button" type="submit" disabled={!authUser.verified}>Submit service for review</button>
+              </div>
+            </form>
+            <form className="surface post-alert" onSubmit={postAlert}>
+              <h3>Post a community alert</h3>
+              <div className="alert-hint"><Icon name="megaphone" size={23}/><p>Share a typed, time-limited update.</p></div>
+              <label>Title<input required maxLength={200} value={alertTitle} onChange={event => setAlertTitle(event.target.value)}/></label>
+              <label>Message<textarea required maxLength={2000} value={alertText} onChange={event => setAlertText(event.target.value)} placeholder="Type your message..."/></label>
+              <label>Type<select value={alertType} onChange={event => setAlertType(event.target.value)}><option>Warning</option><option>Food</option><option>Shelter</option><option>Medical</option></select></label>
+              <label>Expires at <span>(optional)</span><input type="datetime-local" value={alertExpiresAt} onChange={event => setAlertExpiresAt(event.target.value)}/></label>
+              <button className="accept-button" type="submit" disabled={!authUser.verified}>Post alert</button>
+              {!authUser.verified && <small>Administrator verification is required to post alerts.</small>}
+            </form>
+          </>}
+          {ownedListings.map(listing => <form className="surface post-alert" key={`${listing.listing_type}-${listing.id}`} onSubmit={event => updateOwnedListing(event, listing)}>
+            <h3>Edit {listing.listing_type}: {listing.name || listing.area}</h3>
+            <span className={listing.verified && !listing.blocked ? 'verified-tag' : 'pending-tag'}>{listing.blocked ? 'Blocked' : listing.closed ? 'Closed' : listing.verified ? 'Public' : 'Pending admin review'}</span>
+            {listing.listing_type !== 'accommodation' && <label>Name<input name="name" required defaultValue={listing.name}/></label>}
+            {listing.listing_type === 'service' && <label>Category<select name="category" defaultValue={listing.category}><option>Food</option><option>Healthcare</option><option>Medical</option><option>Legal</option><option>Transport</option><option>Other</option></select></label>}
+            <label>City<input name="city" required defaultValue={listing.city}/></label>
+            {listing.listing_type !== 'service' && <label>Area<input name="area" required defaultValue={listing.area}/></label>}
+            <label>Address<input name="address" defaultValue={listing.address}/></label>
+            {listing.listing_type === 'shelter' && <><label>Phone<input name="phone" defaultValue={listing.phone}/></label><label>Beds available<input name="beds_available" required type="number" min="0" defaultValue={listing.beds_available}/></label><label><input name="women_safe" type="checkbox" defaultChecked={Boolean(listing.women_safe)}/> Women-safe</label><label><input name="family_friendly" type="checkbox" defaultChecked={Boolean(listing.family_friendly)}/> Family-friendly</label></>}
+            {listing.listing_type === 'accommodation' && <><label>Rooms<input name="rooms" required type="number" min="1" defaultValue={listing.rooms}/></label><label><input name="women_only" type="checkbox" defaultChecked={Boolean(listing.women_only)}/> Women-only</label><label>Description<textarea name="description" defaultValue={listing.description}/></label></>}
+            {listing.listing_type === 'service' && <><label>Opening hours<input name="opening_hours" defaultValue={listing.opening_hours}/></label><label>Contact<input name="contact" defaultValue={listing.contact}/></label></>}
+            <div className="button-row"><button className="accept-button" type="submit" disabled={!authUser?.verified}>Save changes</button><button className="outline-button" type="button" onClick={() => changeListingStatus(listing)} disabled={!authUser?.verified}>{listing.closed ? 'Reopen listing' : 'Close listing'}</button></div>
+          </form>)}
+        </div>
         <div className="impact-banner ngo-banner"><div className="banner-art"><Icon name="people" size={64}/></div><div><h3>Be the bridge in someone’s journey.</h3><p>Your support makes a difference.</p></div><button className="outline-button" onClick={() => open('about')}>Learn More <Icon name="arrow" size={12}/></button></div>
       </div>
     </section>
@@ -461,13 +673,22 @@ export default function App() {
           .then(() => { setModal(null); notify('SOS submitted to the NGO queue.') })
           .catch(error => notify(error instanceof Error ? error.message : 'SOS could not be submitted.'))
       }}><label>Name <span>(optional)</span><input name="name" placeholder="How should we address you?"/></label><label>Phone <span>(optional)</span><input name="phone" type="tel" placeholder="A number an NGO can reach you on"/></label><label>Your location <span>(optional)</span><textarea name="location" placeholder="City, area or nearby landmark. Do not share sensitive details."/></label><input className="sr-only" name="website" tabIndex={-1} autoComplete="off" aria-hidden="true"/><button className="accept-button" type="submit"><Icon name="alert" size={18}/> Send SOS</button></form></>}
-      {modal === 'alerts' && <><h2 id="modal-title">Community alerts</h2><p className="modal-intro">Current updates published by verified partners.</p><div className="listing-list">{alerts.length ? alerts.map((text, i) => <article className="listing alert-listing" key={`${text}-${i}`}><span className="alert-circle"><Icon name="megaphone"/></span><div><span className="verified-tag">Verified community update</span><h3>{text}</h3></div></article>) : <p className="empty-state">There are no current community alerts.</p>}</div></>}
+      {modal === 'alerts' && <><h2 id="modal-title">Community alerts</h2><p className="modal-intro">Current updates published by verified partners.</p><div className="listing-list">{alerts.length ? alerts.map(alert => <article className="listing alert-listing" key={alert.id}><span className="alert-circle"><Icon name="megaphone"/></span><div><span className="verified-tag">{alert.type} · {alert.partner_name}</span><h3>{alert.title}</h3><p>{alert.message}</p><small>{alert.expires_at ? `Expires ${new Date(alert.expires_at).toLocaleString()}` : 'No expiry set'}</small></div></article>) : <p className="empty-state">There are no current community alerts.</p>}</div>
+        {authUser?.role === 'NGO' && <><h3>Your alerts</h3>{managedAlerts.length ? managedAlerts.map(alert => <form className="listing" key={alert.id} onSubmit={event => updateAlert(event, alert)}>
+          <span className={alert.archived ? 'pending-tag' : 'verified-tag'}>{alert.archived ? 'Archived' : alert.type}</span>
+          <label>Title<input name="title" required maxLength={200} defaultValue={alert.title} disabled={Boolean(alert.archived)}/></label>
+          <label>Message<textarea name="message" required maxLength={2000} defaultValue={alert.message} disabled={Boolean(alert.archived)}/></label>
+          <label>Type<select name="type" defaultValue={alert.type} disabled={Boolean(alert.archived)}><option>Warning</option><option>Food</option><option>Shelter</option><option>Medical</option></select></label>
+          <label>Expires at <span>(optional)</span><input name="expires_at" type="datetime-local" defaultValue={localDateTimeInput(alert.expires_at)} disabled={Boolean(alert.archived)}/></label>
+          <div className="button-row"><button className="accept-button" type="submit" disabled={Boolean(alert.archived) || !authUser.verified}>Save alert</button><button className="reject-button" type="button" onClick={() => archiveAlert(alert)} disabled={Boolean(alert.archived) || !authUser.verified}>Archive</button></div>
+        </form>) : <p className="empty-state">You have not posted any alerts.</p>}</>}
+      </>}
       {modal === 'services' && <><h2 id="modal-title">Everyday essentials.</h2><p className="modal-intro">Services listed by verified community partners.</p>{apiServices.length ? apiServices.map(service => <article className="listing service-listing" key={service.id}><Icon name="people" size={30}/><div><span className="verified-tag">{service.category} · Verified service</span><h3>{service.name}</h3><p>{service.city}</p><small>{service.opening_hours || 'Hours not provided'}</small></div></article>) : <p className="empty-state">No verified services are currently listed.</p>}</>}
       {modal === 'helplines' && <><h2 id="modal-title">You don’t have to face it alone.</h2><p className="modal-intro">India emergency helplines. Tap a number to call directly.</p><Helplines full/><p className="privacy-note"><Icon name="shield" size={17}/> In an emergency, call a helpline first. WarBridge is a coordination tool, not an emergency service.</p></>}
-      {modal === 'requests' && <><h2 id="modal-title">Help requests</h2><p className="modal-intro">Requests are shown only to the account that owns them or is authorized to handle them.</p>{requests.length ? requests.map(r => <article className="listing request-modal-row" key={r.id}><div><span className={r.accepted ? 'verified-tag' : 'pending-tag'}>{r.status || (r.accepted ? 'Accepted' : 'Pending')}</span><h3>{r.title}</h3><p>{r.city} · {r.time}</p></div><div className="button-row"><button className="outline-button" onClick={() => { setSelectedRequest(r); open('request-detail') }}>View details</button>{authUser?.role === 'DISPLACED' && !r.sos && ['Pending', 'Accepted'].includes(r.status || '') && <button className="reject-button" onClick={() => updateRequest(r.id, 'cancel')}>Cancel request</button>}</div></article>) : <p className="empty-state">No help requests are available for this account.</p>}</>}
-      {modal === 'request-detail' && selectedRequest && <><h2 id="modal-title">{selectedRequest.title}</h2><p className="modal-intro">{selectedRequest.city} · {selectedRequest.time}</p>{selectedRequest.sos ? <><article className="listing"><span className="pending-tag">SOS · {selectedRequest.status}</span><h3>{selectedRequest.requester_name || 'Caller details'}</h3>{selectedRequest.accepted ? <><p>Contact: {selectedRequest.contact || 'Not provided'}</p><p>Location: {selectedRequest.location_text || 'Not provided'}</p></> : <p>Contact and precise location remain hidden until a verified NGO claims this SOS.</p>}<small>WarBridge does not contact emergency services. Call 112 when appropriate.</small></article>{selectedRequest.accepted ? <div className="button-row"><button className="outline-button" onClick={() => updateSos(selectedRequest.id, 'escalate')}>Escalate to admin</button><button className="accept-button" onClick={() => updateSos(selectedRequest.id, 'resolve')}>Resolve SOS</button></div> : authUser?.role === 'NGO' && <button className="accept-button" onClick={() => { claimSos(selectedRequest.id); setModal(null) }}>Claim SOS</button>}</> : <><article className="listing"><span className="pending-tag">Help request</span><h3>A person is looking for support</h3><p>Review the request and confirm capacity before accepting. Contact details remain private until permitted.</p><small>All access decisions must be made by a verified human.</small></article><button className="primary" onClick={() => { accept(selectedRequest.id); setModal(null) }}>Accept request <Icon name="check" size={16}/></button></>}</>}
-      {modal === 'sos-queue' && <><h2 id="modal-title">{authUser?.role === 'ADMIN' ? 'SOS monitoring' : 'Verified NGO SOS queue'}</h2><p className="modal-intro">Unclaimed SOS requests remain private. A verified NGO must claim a request before seeing contact details or location.</p>{(authUser?.role === 'ADMIN' ? adminSos : requests.filter(request => request.sos)).length ? (authUser?.role === 'ADMIN' ? adminSos : requests.filter(request => request.sos)).map(item => <article className="listing request-modal-row" key={`sos-${item.id}`}><div><span className="pending-tag">{item.status}</span><h3>{item.title}</h3><p>{item.time}</p><small>{item.city}</small></div>{authUser?.role === 'NGO' && <button className="outline-button" onClick={() => { setSelectedRequest(item); open('request-detail') }}>View / claim</button>}</article>) : <p className="empty-state">No unresolved SOS requests.</p>}</>}
-      {modal === 'verification' && <><h2 id="modal-title">Partner verification</h2><p className="modal-intro">Review a partner before granting access to sensitive actions.</p><article className="listing"><span className="pending-tag">Awaiting review</span><h3>{selectedOrg}</h3><p>Review identity documents, organisation registration, references, and contact details before approving.</p><p className="privacy-note">Verification decisions are recorded in the audit history.</p></article><div className="button-row"><button className="approve-button" onClick={() => { const org = verifications.find(v => v.name === selectedOrg); if (org) decide(org.id, true); setModal(null) }}>Approve partner</button><button className="reject-button" onClick={() => { const org = verifications.find(v => v.name === selectedOrg); if (org) decide(org.id, false); setModal(null) }}>Reject</button></div></>}
+      {modal === 'requests' && <><h2 id="modal-title">Help requests</h2><p className="modal-intro">Requests are shown only to the account that owns them or is authorized to handle them.</p>{(authUser?.role === 'NGO' ? requests.filter(item => !item.sos) : requests).length ? (authUser?.role === 'NGO' ? requests.filter(item => !item.sos) : requests).map(r => <article className="listing request-modal-row" key={r.id}><div><span className={r.status === 'Accepted' || r.status === 'Completed' ? 'verified-tag' : 'pending-tag'}>{r.status || 'Unknown'}</span><h3>{r.title}</h3><p>{r.city} · {r.time}</p></div><div className="button-row"><button className="outline-button" onClick={() => { setSelectedRequest(r); open('request-detail') }}>View details</button>{authUser?.role === 'DISPLACED' && !r.sos && ['Pending', 'Accepted'].includes(r.status || '') && <button className="reject-button" onClick={() => updateRequest(r.id, 'cancel')}>Cancel request</button>}</div></article>) : <p className="empty-state">No help requests are available for this account.</p>}</>}
+      {modal === 'request-detail' && selectedRequest && <><h2 id="modal-title">{selectedRequest.title}</h2><p className="modal-intro">{selectedRequest.city} · {selectedRequest.time}</p>{selectedRequest.sos ? <><article className="listing"><span className="pending-tag">SOS · {selectedRequest.status}</span><h3>{selectedRequest.requester_name || (selectedRequest.accepted ? 'Caller details' : 'Caller details are private')}</h3>{selectedRequest.accepted ? <><p>Contact: {selectedRequest.contact || 'Not provided'}</p><p>Location: {selectedRequest.location_text || 'Not provided'}</p></> : <p>Contact and precise location remain hidden until a verified NGO claims this SOS or it is escalated to an administrator.</p>}<small>WarBridge does not contact emergency services. Call 112 when appropriate.</small></article>{authUser?.role === 'ADMIN' && selectedRequest.status === 'Escalated' ? <button className="accept-button" onClick={() => updateSos(selectedRequest.id, 'resolve')}>Resolve escalation</button> : selectedRequest.accepted && authUser?.role === 'NGO' ? <div className="button-row">{selectedRequest.status === 'Accepted' && <button className="outline-button" onClick={() => updateSos(selectedRequest.id, 'escalate')}>Escalate to admin</button>}<button className="accept-button" onClick={() => updateSos(selectedRequest.id, 'resolve')}>Resolve SOS</button></div> : authUser?.role === 'NGO' && <button className="accept-button" onClick={() => { claimSos(selectedRequest.id); setModal(null) }}>Claim SOS</button>}</> : <><article className="listing"><span className={selectedRequest.status === 'Accepted' || selectedRequest.status === 'Completed' ? 'verified-tag' : 'pending-tag'}>Request · {selectedRequest.status || 'Unknown'}</span><h3>{selectedRequest.status === 'Accepted' ? 'A partner accepted this request' : selectedRequest.status === 'Completed' ? 'This request is complete' : selectedRequest.status === 'Rejected' ? 'This request was rejected' : selectedRequest.status === 'Cancelled' ? 'This request was cancelled' : 'A person is looking for support'}</h3><p>{selectedRequest.status === 'Pending' ? 'Review the request and confirm capacity before accepting. Contact details remain private until permitted.' : 'The request status is shown above. No further action is available in this state.'}</p><small>All access decisions must be made by a verified human.</small></article>{(authUser?.role === 'NGO' || authUser?.role === 'HOST') && selectedRequest.status === 'Pending' ? <div className="button-row"><button className="reject-button" onClick={() => updateRequest(selectedRequest.id, 'reject')}>Reject request</button><button className="primary" onClick={() => { accept(selectedRequest.id); setModal(null) }}>Accept request <Icon name="check" size={16}/></button></div> : (authUser?.role === 'NGO' || authUser?.role === 'HOST') && selectedRequest.status === 'Accepted' ? <button className="accept-button" onClick={() => updateRequest(selectedRequest.id, 'complete')}>Mark completed</button> : authUser?.role === 'DISPLACED' && ['Pending', 'Accepted'].includes(selectedRequest.status || '') ? <button className="reject-button" onClick={() => updateRequest(selectedRequest.id, 'cancel')}>Cancel request</button> : null}</>}</>}
+      {modal === 'sos-queue' && <><h2 id="modal-title">{authUser?.role === 'ADMIN' ? 'SOS monitoring' : 'Verified NGO SOS queue'}</h2><p className="modal-intro">Unclaimed SOS requests remain private. Escalated records show caller details to administrators and verified assigned NGOs.</p>{(authUser?.role === 'ADMIN' ? adminSos : requests.filter(request => request.sos)).length ? (authUser?.role === 'ADMIN' ? adminSos : requests.filter(request => request.sos)).map(item => <article className="listing request-modal-row" key={`sos-${item.id}`}><div><span className="pending-tag">{item.status}</span><h3>{item.title}</h3><p>{item.time}</p><small>{item.city}</small></div>{((authUser?.role === 'NGO') || (authUser?.role === 'ADMIN' && item.status === 'Escalated')) && <button className="outline-button" onClick={() => { setSelectedRequest(item); open('request-detail') }}>{item.accepted ? 'View details' : 'View / claim'}</button>}</article>) : <p className="empty-state">No unresolved SOS requests.</p>}</>}
+      {modal === 'verification' && <><h2 id="modal-title">Partner verification</h2><p className="modal-intro">Review a partner before granting access to sensitive actions.</p><article className="listing"><span className="pending-tag">Awaiting review</span><h3>{selectedOrg}</h3><p>WarBridge does not collect or validate identity documents. Confirm registration, references and contacts through your approved secure process before deciding.</p><p className="privacy-note">Verification decisions are recorded in the audit history. Approval here records a manual administrator decision, not an identity-provider check.</p></article><div className="button-row"><button className="approve-button" onClick={() => { const org = verifications.find(v => v.name === selectedOrg); if (org) decide(org.id, true); setModal(null) }}>Approve partner</button><button className="reject-button" onClick={() => { const org = verifications.find(v => v.name === selectedOrg); if (org) decide(org.id, false); setModal(null) }}>Reject</button></div></>}
       {modal === 'signin' && <>
         <h2 id="modal-title">{authMode === 'signin' ? 'Sign in to WarBridge' : `Register ${authRole === 'DISPLACED' ? 'as a displaced person' : authRole === 'HOST' ? 'as a host' : 'your NGO'}`}</h2>
         <p className="modal-intro">{authMode === 'signin' ? 'Choose your account type and sign in with your registered name or email.' : 'Partner accounts require administrator verification before they can publish listings or handle requests.'}</p>
@@ -483,7 +704,15 @@ export default function App() {
         {authRole !== 'ADMIN' && <button className="text-link" onClick={() => { setAuthMode(authMode === 'signin' ? 'register' : 'signin'); setAuthError('') }}>{authMode === 'signin' ? 'Create an account' : 'Already registered? Sign in'}</button>}
         {authMode === 'signin' && <button className="text-link" onClick={() => { setAuthRole('DISPLACED'); setAuthError('') }}>Continue as a displaced person</button>}
       </>}
-      {modal === 'ratings' && <><h2 id="modal-title">Share your experience.</h2><p className="modal-intro">You can rate a shelter after your help request is marked complete.</p><p className="empty-state">There are no completed stays available to rate.</p></>}
+      {modal === 'ratings' && <><h2 id="modal-title">Share your experience.</h2><p className="modal-intro">Rate a shelter or host stay after your help request is marked complete.</p>{requests.filter(item => item.status === 'Completed' && item.listing_type && item.listing_id).length ? requests.filter(item => item.status === 'Completed' && item.listing_type && item.listing_id).map(item => {
+        const existing = ratings.find(rating => rating.listing_type === item.listing_type && rating.listing_id === item.listing_id)
+        return <form className="listing" key={`${item.listing_type}-${item.listing_id}`} onSubmit={event => submitRating(event, item)}>
+          <h3>{item.title} · {item.city}</h3>
+          <label>Rating<select name="stars" defaultValue={existing?.stars || 5}><option value="5">5 — Excellent</option><option value="4">4 — Good</option><option value="3">3 — Okay</option><option value="2">2 — Poor</option><option value="1">1 — Very poor</option></select></label>
+          <label>Comment<textarea name="comment" maxLength={1000} defaultValue={existing?.comment || ''} placeholder="Share an optional note"/></label>
+          <button className="accept-button" type="submit">{existing ? 'Update rating' : 'Submit rating'}</button>
+        </form>
+      }) : <p className="empty-state">Completed stays eligible for rating will appear here.</p>}</>}
       {modal === 'reports' && <><h2 id="modal-title">Help keep the community safe.</h2><p className="modal-intro">Report a suspicious or unsafe listing for administrator review.</p><form className="modal-form" onSubmit={event => {
         event.preventDefault()
         const form = new FormData(event.currentTarget)

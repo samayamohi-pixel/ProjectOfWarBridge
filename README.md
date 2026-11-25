@@ -34,9 +34,10 @@ Displaced people, hosts, and NGOs can register through the sign-in form. Host an
 
 - `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`
 - `GET /api/public/shelters`, `GET /api/public/accommodations`, `GET /api/public/services`, `GET /api/public/alerts`
-- `POST /api/sos`, `POST /api/requests`
+- `POST /api/sos`, `GET /api/admin/sos`, `POST /api/requests`
 - Verified NGO SOS queue: `GET /api/sos/incoming`, `POST /api/sos/<id>/claim`, `POST /api/sos/<id>/escalate`, `POST /api/sos/<id>/resolve`
-- NGO/host request handling, shelter/accommodation creation, verified-partner actions
+- NGO/host request handling; `POST /api/shelters`, `/api/accommodations`, `/api/services`, `GET /api/listings/mine`, `PATCH /api/listings/<type>/<id>`, and listing close/reopen actions
+- Alert create/edit/archive with expiry and type management; `POST /api/ratings` and `GET /api/ratings/mine` for completed shelter/host requests
 - Admin verification, listing moderation, reports, SOS monitoring, and audit log
 - Health checks: `GET /api/health/live`, `GET /api/health/ready`
 
@@ -50,13 +51,34 @@ Production startup requires a private `SECRET_KEY` of at least 32 characters and
 WARBRIDGE_ENV=production SECRET_KEY="<private-random-value>" HTTPS_ONLY=1 gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
 ```
 
-SQLite is intended for local development and small pilots. The app applies versioned schema migrations on startup and uses database-backed rate limits and atomic capacity transactions. Production still requires a shared production database, encrypted backups and restore tests, monitoring, and locally reviewed emergency escalation procedures.
+SQLite is intended for local development and small pilots. The app applies versioned schema migrations on startup and uses database-backed rate limits and atomic capacity transactions. The backup utility makes a consistent SQLite copy, runs `PRAGMA integrity_check`, and supports a restore that first preserves the current database:
+
+```powershell
+python db_backup.py --database .\warbridge.db backup --output D:\secure-backups\warbridge-20261126T001200Z.sqlite3
+python db_backup.py --database .\warbridge.db restore --input D:\secure-backups\warbridge-20261126T001200Z.sqlite3 --confirm-restore
+```
+
+Stop the application before restoring. Backups contain sensitive contact and SOS data; store them only in access-controlled, encrypted storage and regularly test restores in an isolated environment. The included automated tests exercise backup and restore behavior, but do not validate a production storage provider.
+
+The health endpoints provide basic liveness/readiness checks; production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
+
+### Embedded preview and session cookies
+
+Framing and cross-origin API access are deny-by-default. Configure exact origins for the deployment; do not use wildcards:
+
+```text
+FRAME_ANCESTORS="'self',https://your-preview.example"
+CORS_ALLOWED_ORIGINS=https://your-preview.example
+SESSION_COOKIE_SAMESITE=None
+```
+
+`FRAME_ANCESTORS` accepts `'none'` (the default), `'self'`, or comma-separated HTTP(S) origins. `CORS_ALLOWED_ORIGINS` accepts comma-separated HTTP(S) origins. Cross-site iframe cookies require HTTPS, `HTTPS_ONLY=1`, and `SESSION_COOKIE_SAMESITE=None`; the application rejects `SameSite=None` without secure cookies. Set only the exact preview origin(s) you control. The frontend sends credentials, and the backend responds with credentialed CORS headers only for this explicit allowlist.
 
 ## Safety and implementation boundaries
 
 An SOS is stored in a private database queue; it is not sent to emergency services, and no response is guaranteed. A verified NGO must explicitly claim it before contact/location details are released. Escalation changes its state and exposes it to administrators; it does not dispatch an external alert.
 
-The app cannot determine identity or intent. NGOs, hosts, and shelters must make access decisions and screen people in person. Women-only eligibility is self-declared, not identity verification. Alerts are in-app only, not SMS or push. Listing freshness depends on partner updates. Complete external identity/document checks, persistent operational logging and backups, native Arabic/Hindi review, and a security and safeguarding review before real deployment.
+The app cannot determine identity or intent. NGOs, hosts, and shelters must make access decisions and screen people in person. Women-only eligibility is self-declared, not identity verification. Alerts are in-app only, not SMS or push. Listing freshness depends on partner updates. A real identity/document-check integration, managed production monitoring and encrypted backup storage, human-reviewed translations, and a security and safeguarding review are still required before real deployment.
 
 ## Development
 

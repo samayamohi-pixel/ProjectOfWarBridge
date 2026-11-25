@@ -28,11 +28,70 @@ if APP_ENV not in ("development", "test") and os.getenv("HTTPS_ONLY") != "1":
 if APP_ENV not in ("development", "test") and len(secret_key) < 32:
     raise RuntimeError("SECRET_KEY must be at least 32 characters outside development and test modes")
 
+def normalize_origin(candidate, env_name):
+    try:
+        parsed = urlsplit(candidate)
+        parsed.port
+    except ValueError as error:
+        raise RuntimeError(f"{env_name} must contain valid HTTP(S) origins") from error
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or "*" in candidate
+        or any(character.isspace() or character in ";'\"\\<>" for character in candidate)
+        or APP_ENV not in ("development", "test") and parsed.scheme != "https"
+    ):
+        raise RuntimeError(f"{env_name} must contain valid HTTP(S) origins")
+    hostname = parsed.hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    port = parsed.port
+    if port == (443 if parsed.scheme == "https" else 80):
+        port = None
+    port_suffix = f":{port}" if port else ""
+    return f"{parsed.scheme}://{hostname}{port_suffix}"
+
+
+def parse_origin_list(env_name):
+    origins = []
+    for candidate in filter(None, (item.strip() for item in os.getenv(env_name, "").split(","))):
+        origins.append(normalize_origin(candidate, env_name))
+    return tuple(dict.fromkeys(origins))
+
+
+frame_ancestors = os.getenv("FRAME_ANCESTORS", "'none'").strip()
+if frame_ancestors == "'none'":
+    FRAME_ANCESTORS = ("'none'",)
+else:
+    frame_values = []
+    for candidate in filter(None, (item.strip() for item in frame_ancestors.split(","))):
+        if candidate == "'self'":
+            frame_values.append(candidate)
+            continue
+        frame_values.append(normalize_origin(candidate, "FRAME_ANCESTORS"))
+    if not frame_values:
+        raise RuntimeError("FRAME_ANCESTORS must not be empty")
+    FRAME_ANCESTORS = tuple(dict.fromkeys(frame_values))
+
+ALLOWED_CORS_ORIGINS = parse_origin_list("CORS_ALLOWED_ORIGINS")
+same_site = os.getenv("SESSION_COOKIE_SAMESITE", "Lax").strip().capitalize()
+if same_site not in ("Lax", "Strict", "None"):
+    raise RuntimeError("SESSION_COOKIE_SAMESITE must be Lax, Strict, or None")
+cookie_secure = APP_ENV not in ("development", "test") or os.getenv("HTTPS_ONLY") == "1"
+if same_site == "None" and not cookie_secure:
+    raise RuntimeError("SESSION_COOKIE_SAMESITE=None requires HTTPS_ONLY=1")
+
 app.config.update(
     SECRET_KEY=secret_key,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=APP_ENV not in ("development", "test") or os.getenv("HTTPS_ONLY") == "1",
+    SESSION_COOKIE_SAMESITE=same_site,
+    SESSION_COOKIE_SECURE=cookie_secure,
 )
 try:
     trusted_proxy_count = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
@@ -75,11 +134,21 @@ def security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    response.headers.setdefault("X-Frame-Options", "DENY")
+    if FRAME_ANCESTORS == ("'none'",):
+        response.headers.setdefault("X-Frame-Options", "DENY")
+    elif FRAME_ANCESTORS == ("'self'",):
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+        f"default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors {' '.join(FRAME_ANCESTORS)}; form-action 'self'",
     )
+    origin = request.headers.get("Origin")
+    if origin and origin in ALLOWED_CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-CSRF-Token"
+        response.vary.add("Origin")
     if APP_ENV not in ("development", "test"):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
@@ -114,6 +183,7 @@ def init_db():
             family_friendly INTEGER NOT NULL DEFAULT 0,
             verified INTEGER NOT NULL DEFAULT 0,
             blocked INTEGER NOT NULL DEFAULT 0,
+            closed INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS help_requests (
@@ -181,6 +251,7 @@ def init_db():
             type TEXT NOT NULL,
             expires_at TEXT,
             blocked INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -195,6 +266,7 @@ def init_db():
             address TEXT,
             verified INTEGER NOT NULL DEFAULT 0,
             blocked INTEGER NOT NULL DEFAULT 0,
+            closed INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
@@ -231,6 +303,12 @@ def init_db():
         ensure_column(db, "help_requests", "claimed_at", "TEXT")
         ensure_column(db, "help_requests", "escalated_at", "TEXT")
         db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)", (utcnow(),))
+        current_version = 1
+    if current_version < 2:
+        ensure_column(db, "shelters", "closed", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "services", "closed", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(db, "alerts", "archived", "INTEGER NOT NULL DEFAULT 0")
+        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)", (utcnow(),))
     db.commit()
 
     admin_email = os.getenv("WARBRIDGE_ADMIN_EMAIL")
@@ -492,7 +570,7 @@ def public_alerts():
     rows = get_db().execute(
         """SELECT a.*, u.name AS partner_name FROM alerts a
            JOIN users u ON u.id=a.ngo_id
-           WHERE a.blocked=0 AND u.verified=1 AND u.blocked=0
+           WHERE a.blocked=0 AND a.archived=0 AND u.verified=1 AND u.blocked=0
              AND (a.expires_at IS NULL OR a.expires_at > ?)
            ORDER BY a.created_at DESC LIMIT 3""",
         (now,),
@@ -505,7 +583,7 @@ def public_shelters():
     city = request.args.get("city", "").strip()
     women_safe = request.args.get("women_safe") == "1"
     family_friendly = request.args.get("family_friendly") == "1"
-    where = ["s.blocked=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
+    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
     params = []
     if city:
         where.append("LOWER(s.city) LIKE LOWER(?)")
@@ -532,7 +610,7 @@ def public_shelters():
 def public_services():
     city = request.args.get("city", "").strip()
     category = request.args.get("category", "").strip()
-    where = ["s.blocked=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
+    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
     params = []
     if city:
         where.append("LOWER(city) LIKE LOWER(?)")
@@ -623,12 +701,23 @@ def incoming_sos(user):
 @app.get("/api/admin/sos")
 @role_required("ADMIN")
 def admin_sos(user):
-    rows = get_db().execute(
+    db = get_db()
+    rows = db.execute(
         """SELECT * FROM help_requests
            WHERE is_sos=1 AND status IN ('Pending','Accepted','Escalated')
            ORDER BY CASE status WHEN 'Escalated' THEN 0 ELSE 1 END, created_at ASC"""
     ).fetchall()
-    return jsonify({"requests": [protected_sos(row) for row in rows]})
+    escalated_rows = [row for row in rows if row["status"] == "Escalated"]
+    for row in escalated_rows:
+        audit(user["id"], "sos_details_accessed", "help_request", row["id"])
+    if escalated_rows:
+        db.commit()
+    return jsonify({
+        "requests": [
+            protected_sos(row, include_private=row["status"] == "Escalated")
+            for row in rows
+        ]
+    })
 
 
 @app.post("/api/sos/<int:request_id>/claim")
@@ -731,7 +820,7 @@ def create_request(user):
                WHERE s.id=? AND u.verified=1 AND u.blocked=0""",
             (shelter_id,),
         ).fetchone()
-        if not shelter or shelter["blocked"] or not shelter["verified"]:
+        if not shelter or shelter["blocked"] or shelter["closed"] or not shelter["verified"]:
             return jsonify({"error": "Shelter is not available"}), 404
         if shelter["beds_available"] < 1:
             return jsonify({"error": "No beds are currently available"}), 409
@@ -902,7 +991,7 @@ def handle_request(user, request_id, action):
     if action == "accept" and row["shelter_id"]:
         capacity = db.execute(
             """UPDATE shelters SET beds_available=beds_available-1,updated_at=?
-               WHERE id=? AND beds_available > 0 AND verified=1 AND blocked=0""",
+               WHERE id=? AND beds_available > 0 AND verified=1 AND blocked=0 AND closed=0""",
             (utcnow(), row["shelter_id"]),
         )
         if capacity.rowcount != 1:
@@ -981,6 +1070,191 @@ def create_accommodation(user):
     return jsonify({"id": cur.lastrowid}), 201
 
 
+@app.post("/api/services")
+@role_required("NGO")
+def create_service(user):
+    denied = require_csrf()
+    if denied:
+        return denied
+    if not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON service object is required"}), 400
+    name = str(data.get("name", "")).strip()
+    category = str(data.get("category", "")).strip()
+    city = str(data.get("city", "")).strip()
+    if not name or not city or category not in ("Food", "Healthcare", "Medical", "Legal", "Transport", "Other"):
+        return jsonify({"error": "Name, city and a supported service category are required"}), 400
+    db = get_db()
+    cur = db.execute(
+        """INSERT INTO services(ngo_id,name,category,city,opening_hours,contact,address,verified,blocked,closed,updated_at)
+           VALUES(?,?,?,?,?,?,?,0,0,0,?)""",
+        (
+            user["id"],
+            name[:120],
+            category,
+            city[:100],
+            str(data.get("opening_hours", ""))[:120],
+            str(data.get("contact", ""))[:80],
+            str(data.get("address", ""))[:300],
+            utcnow(),
+        ),
+    )
+    audit_and_commit(db, user["id"], "service_created", "service", cur.lastrowid)
+    return jsonify({"id": cur.lastrowid}), 201
+
+
+LISTING_FIELDS = {
+    "shelter": {
+        "table": "shelters",
+        "owner_column": "ngo_id",
+        "role": "NGO",
+        "text": {"name": 120, "city": 100, "area": 120, "address": 300, "phone": 40},
+        "integers": {"beds_available": 0},
+        "booleans": ("women_safe", "family_friendly"),
+    },
+    "accommodation": {
+        "table": "accommodations",
+        "owner_column": "host_id",
+        "role": "HOST",
+        "text": {"city": 100, "area": 120, "address": 300, "description": 1000},
+        "integers": {"rooms": 1},
+        "booleans": ("women_only",),
+    },
+    "service": {
+        "table": "services",
+        "owner_column": "ngo_id",
+        "role": "NGO",
+        "text": {"name": 120, "category": 40, "city": 100, "opening_hours": 120, "contact": 80, "address": 300},
+        "integers": {},
+        "booleans": (),
+    },
+}
+
+
+@app.get("/api/listings/mine")
+@role_required("NGO", "HOST")
+def my_listings(user):
+    db = get_db()
+    if user["role"] == "NGO":
+        rows = []
+        for listing_type, table, owner_column in (
+            ("shelter", "shelters", "ngo_id"),
+            ("service", "services", "ngo_id"),
+        ):
+            columns = (
+                "id,name,city,area,address,phone,beds_available,women_safe,family_friendly,verified,blocked,closed,updated_at"
+                if listing_type == "shelter"
+                else "id,name,category,city,opening_hours,contact,address,verified,blocked,closed,updated_at"
+            )
+            result = db.execute(
+                f"SELECT {columns} FROM {table} WHERE {owner_column}=?",
+                (user["id"],),
+            ).fetchall()
+            rows.extend({**json_row(row), "listing_type": listing_type} for row in result)
+    else:
+        result = db.execute(
+            """SELECT id,city,area,address,rooms,rooms_available,women_only,description,verified,blocked,closed,updated_at
+               FROM accommodations WHERE host_id=?""",
+            (user["id"],),
+        ).fetchall()
+        rows = [{**json_row(row), "name": row["area"], "listing_type": "accommodation"} for row in result]
+    return jsonify({"listings": rows})
+
+
+@app.patch("/api/listings/<listing_type>/<int:listing_id>")
+@role_required("NGO", "HOST")
+def update_listing(user, listing_type, listing_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    spec = LISTING_FIELDS.get(listing_type)
+    if not spec or user["role"] != spec["role"]:
+        return jsonify({"error": "Listing type is not available to this account"}), 404
+    if not verified_required(user):
+        return jsonify({"error": "Partner verification required"}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return jsonify({"error": "At least one listing field is required"}), 400
+    allowed = set(spec["text"]) | set(spec["integers"]) | set(spec["booleans"])
+    if set(data) - allowed:
+        return jsonify({"error": "Unsupported listing field"}), 400
+
+    fields = {}
+    for field, limit in spec["text"].items():
+        if field in data:
+            value = str(data[field]).strip()
+            if field in ("name", "city", "area", "category") and not value:
+                return jsonify({"error": f"{field} cannot be empty"}), 400
+            if field == "category" and value not in ("Food", "Healthcare", "Medical", "Legal", "Transport", "Other"):
+                return jsonify({"error": "Unsupported service category"}), 400
+            fields[field] = value[:limit]
+    for field, minimum in spec["integers"].items():
+        if field in data:
+            value = data[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                return jsonify({"error": f"{field} must be an integer of at least {minimum}"}), 400
+            fields[field] = value
+    for field in spec["booleans"]:
+        if field in data:
+            if not isinstance(data[field], bool):
+                return jsonify({"error": f"{field} must be true or false"}), 400
+            fields[field] = int(data[field])
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    owner_column = spec["owner_column"]
+    row = db.execute(
+        f"SELECT * FROM {spec['table']} WHERE id=? AND {owner_column}=?",
+        (listing_id, user["id"]),
+    ).fetchone()
+    if not row:
+        db.rollback()
+        return jsonify({"error": "Listing not found"}), 404
+    if listing_type == "accommodation" and "rooms" in fields:
+        occupied = row["rooms"] - row["rooms_available"]
+        if fields["rooms"] < occupied:
+            db.rollback()
+            return jsonify({"error": "Rooms cannot be reduced below current accepted stays"}), 409
+        fields["rooms_available"] = fields["rooms"] - occupied
+    fields["updated_at"] = utcnow()
+    assignments = ",".join(f"{field}=?" for field in fields)
+    db.execute(
+        f"UPDATE {spec['table']} SET {assignments} WHERE id=?",
+        (*fields.values(), listing_id),
+    )
+    audit_and_commit(db, user["id"], f"{listing_type}_updated", listing_type, listing_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/listings/<listing_type>/<int:listing_id>/<action>")
+@role_required("NGO", "HOST")
+def change_listing_status(user, listing_type, listing_id, action):
+    denied = require_csrf()
+    if denied:
+        return denied
+    spec = LISTING_FIELDS.get(listing_type)
+    if not spec or user["role"] != spec["role"] or action not in ("close", "reopen"):
+        return jsonify({"error": "Invalid listing action"}), 404
+    if not verified_required(user):
+        return jsonify({"error": "Partner verification required"}), 403
+    db = get_db()
+    row = db.execute(
+        f"SELECT id FROM {spec['table']} WHERE id=? AND {spec['owner_column']}=?",
+        (listing_id, user["id"]),
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "Listing not found"}), 404
+    closed = int(action == "close")
+    db.execute(
+        f"UPDATE {spec['table']} SET closed=?,updated_at=? WHERE id=?",
+        (closed, utcnow(), listing_id),
+    )
+    audit_and_commit(db, user["id"], f"{listing_type}_{action}d", listing_type, listing_id)
+    return jsonify({"ok": True, "closed": bool(closed)})
+
+
 @app.post("/api/alerts")
 @role_required("NGO", "ADMIN")
 def create_alert(user):
@@ -989,7 +1263,9 @@ def create_alert(user):
         return denied
     if user["role"] == "NGO" and not verified_required(user):
         return jsonify({"error": "NGO verification required"}), 403
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON alert object is required"}), 400
     title, message = str(data.get("title", "")).strip(), str(data.get("message", "")).strip()
     alert_type = str(data.get("type", "Warning")).strip()
     if not title or not message or alert_type not in ("Food", "Shelter", "Medical", "Warning"):
@@ -1006,6 +1282,77 @@ def create_alert(user):
     )
     audit_and_commit(db, user["id"], "alert_created", "alert", cur.lastrowid)
     return jsonify({"id": cur.lastrowid}), 201
+
+
+@app.get("/api/alerts/mine")
+@role_required("NGO")
+def my_alerts(user):
+    rows = get_db().execute(
+        "SELECT id,title,message,type,expires_at,archived,updated_at,created_at FROM alerts WHERE ngo_id=? ORDER BY created_at DESC",
+        (user["id"],),
+    ).fetchall()
+    return jsonify({"alerts": [json_row(row) for row in rows]})
+
+
+@app.patch("/api/alerts/<int:alert_id>")
+@role_required("NGO", "ADMIN")
+def update_alert(user, alert_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data or set(data) - {"title", "message", "type", "expires_at"}:
+        return jsonify({"error": "Provide supported alert fields to update"}), 400
+    db = get_db()
+    row = db.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    if not row or user["role"] != "ADMIN" and row["ngo_id"] != user["id"]:
+        return jsonify({"error": "Alert not found"}), 404
+    if user["role"] == "NGO" and not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    fields = {}
+    if "title" in data:
+        title = str(data["title"]).strip()
+        if not title:
+            return jsonify({"error": "Title cannot be empty"}), 400
+        fields["title"] = title[:200]
+    if "message" in data:
+        message = str(data["message"]).strip()
+        if not message:
+            return jsonify({"error": "Message cannot be empty"}), 400
+        fields["message"] = message[:2000]
+    if "type" in data:
+        if data["type"] not in ("Food", "Shelter", "Medical", "Warning"):
+            return jsonify({"error": "Invalid alert type"}), 400
+        fields["type"] = data["type"]
+    if "expires_at" in data:
+        expires_at = parse_expiry(data["expires_at"])
+        if expires_at is False:
+            return jsonify({"error": "expires_at must be a valid ISO-8601 timestamp with a timezone"}), 400
+        if expires_at and datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+            return jsonify({"error": "expires_at must be in the future"}), 400
+        fields["expires_at"] = expires_at
+    fields["updated_at"] = utcnow()
+    assignments = ",".join(f"{field}=?" for field in fields)
+    db.execute(f"UPDATE alerts SET {assignments} WHERE id=?", (*fields.values(), alert_id))
+    audit_and_commit(db, user["id"], "alert_updated", "alert", alert_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/alerts/<int:alert_id>/archive")
+@role_required("NGO", "ADMIN")
+def archive_alert(user, alert_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    db = get_db()
+    row = db.execute("SELECT ngo_id FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    if not row or user["role"] != "ADMIN" and row["ngo_id"] != user["id"]:
+        return jsonify({"error": "Alert not found"}), 404
+    if user["role"] == "NGO" and not verified_required(user):
+        return jsonify({"error": "NGO verification required"}), 403
+    db.execute("UPDATE alerts SET archived=1,updated_at=? WHERE id=?", (utcnow(), alert_id))
+    audit_and_commit(db, user["id"], "alert_archived", "alert", alert_id)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/reports")
@@ -1077,6 +1424,16 @@ def create_rating(user):
     )
     audit_and_commit(db, user["id"], "rating_submitted", listing_type, listing_id)
     return jsonify({"ok": True})
+
+
+@app.get("/api/ratings/mine")
+@role_required("DISPLACED")
+def my_ratings(user):
+    rows = get_db().execute(
+        "SELECT listing_type,listing_id,stars,comment,updated_at FROM ratings WHERE user_id=?",
+        (user["id"],),
+    ).fetchall()
+    return jsonify({"ratings": [json_row(row) for row in rows]})
 
 
 @app.get("/api/admin/verifications")
