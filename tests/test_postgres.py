@@ -107,10 +107,11 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
 
     def test_foreign_keys_are_declared_and_enforced(self):
         os.environ["WARBRIDGE_ENV"] = "test"
-        from app import app, get_db, utcnow
+        from app import app, get_db, init_db, utcnow
         from database import DatabaseIntegrityError
 
         with app.app_context():
+            init_db()
             db = get_db()
             foreign_keys = {
                 (row["table_name"], row["column_name"], row["foreign_table_name"])
@@ -152,11 +153,12 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
 
     def test_concurrent_acceptance_cannot_overbook_postgresql_capacity(self):
         os.environ["WARBRIDGE_ENV"] = "test"
-        from app import app, get_db, utcnow
+        from app import app, get_db, init_db, utcnow
 
         app.config.update(TESTING=True)
         suffix = uuid.uuid4().hex
         with app.app_context():
+            init_db()
             db = get_db()
             self.assertEqual(db.dialect, "postgresql")
             host = db.execute(
