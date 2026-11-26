@@ -78,6 +78,29 @@ $env:WARBRIDGE_DB_CONNECTION_TIMEOUT = "10"
 
 In production, set `WARBRIDGE_DATABASE_URL` (or `DATABASE_URL`) to the PostgreSQL URL. In tests, only `WARBRIDGE_TEST_DATABASE_URL` is used for PostgreSQL, and it is rejected if it matches the production URL. Without a PostgreSQL URL, the app uses SQLite at `WARBRIDGE_DB` or `warbridge.db`.
 
+### Local PostgreSQL integration tests
+
+`docker-compose.yml` starts only a disposable PostgreSQL 16 test service. It binds to loopback port `54329`, uses trust authentication only inside this local test container, and has no persistent volume. Do not reuse this configuration for production. The PostgreSQL test URL is deliberately separate from production settings.
+
+Run the full backend suite with PostgreSQL enabled, then the frontend checks and build:
+
+```powershell
+docker compose up -d --wait postgres
+python -m pip install -r backend_requirements.txt
+$env:WARBRIDGE_ENV = "test"
+$env:WARBRIDGE_TEST_DATABASE_URL = "postgresql://warbridge_test@localhost:54329/warbridge_test"
+$env:SECRET_KEY = (python -c "import secrets; print(secrets.token_hex(32))")
+python -m unittest discover -s tests -p "test_postgres.py" -v
+python run_tests.py
+node --test tests/frontend-localization.test.mjs
+npx tsc --noEmit
+pnpm install --frozen-lockfile
+pnpm build
+docker compose down -v
+```
+
+`run_tests.py` fails if any test is skipped, including PostgreSQL tests. Keep the PostgreSQL service running while executing the commands; `docker compose down -v` removes the disposable container and its data when finished. GitHub Actions runs the same PostgreSQL integration tests and checks against its own disposable PostgreSQL service.
+
 To preserve records when moving an existing SQLite demo database to a new, empty PostgreSQL database, set the PostgreSQL target URL and run the importer before switching the application over:
 
 ```powershell
@@ -188,7 +211,7 @@ The Make environment already manages the preview server.
 
 - `pnpm build` — production frontend build
 - `pnpm format` — project formatter
-- `python -m unittest discover -s tests -v` — backend regression tests
+- `python run_tests.py` — backend regression tests; fails on skipped tests
 - `node --test tests/frontend-localization.test.mjs` — localization behavior and English-key coverage
 - `npx tsc --noEmit` — frontend type check
 
