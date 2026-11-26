@@ -13,12 +13,16 @@ In a second terminal, set explicit development configuration and start the backe
 
 ```powershell
 $env:WARBRIDGE_ENV = "development"
+$env:WARBRIDGE_DB = ".\warbridge-demo.db"
 $env:SECRET_KEY = "local-development-only-change-this"
 python -m pip install -r backend_requirements.txt
+python seed_demo.py
 python app.py
 ```
 
 Vite proxies `/api` requests to `http://127.0.0.1:5000`. The known fallback key is available only in explicit development mode. Never use it in a deployment.
+
+`seed_demo.py` creates fictional sample records for the full walkthrough: a displaced user with pending and completed requests, an NGO with public listings, a host with an incoming stay request, a pending NGO and listing for admin review, a private SOS queue entry, and an open report. It prints a randomly generated temporary password on the first run; use it with any listed demo account. The seed command is restricted to explicit development mode, and rerunning it leaves existing records unchanged. Keep this isolated demo database separate from any real-user data.
 
 Create the first administrator account with:
 
