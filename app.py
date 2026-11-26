@@ -2210,12 +2210,32 @@ def admin_analytics(user):
             request_status[row["status"]] = row["count"]
 
     request_periods = {}
+    if db.dialect == "postgresql":
+        created_at_expression = "created_at::timestamptz"
+        updated_at_expression = "updated_at::timestamptz"
+        cutoff_expression = "?::timestamptz"
+        sos_response_average = (
+            "AVG(EXTRACT(EPOCH FROM "
+            "(claimed_at::timestamptz - created_at::timestamptz)))::double precision"
+        )
+        sos_response_order = (
+            "claimed_at::timestamptz>=created_at::timestamptz"
+        )
+    else:
+        created_at_expression = "julianday(created_at)"
+        updated_at_expression = "julianday(updated_at)"
+        cutoff_expression = "julianday(?)"
+        sos_response_average = (
+            "AVG((julianday(claimed_at)-julianday(created_at))*86400.0)"
+        )
+        sos_response_order = "julianday(claimed_at)>=julianday(created_at)"
+
     for days in (7, 30, 90):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         row = db.execute(
-            """SELECT
-                   SUM(CASE WHEN julianday(created_at)>=julianday(?) THEN 1 ELSE 0 END) AS created,
-                   SUM(CASE WHEN status=? AND julianday(updated_at)>=julianday(?) THEN 1 ELSE 0 END) AS completed
+            f"""SELECT
+                   SUM(CASE WHEN {created_at_expression}>={cutoff_expression} THEN 1 ELSE 0 END) AS created,
+                   SUM(CASE WHEN status=? AND {updated_at_expression}>={cutoff_expression} THEN 1 ELSE 0 END) AS completed
                FROM help_requests WHERE is_sos=?""",
             (cutoff, "Completed", cutoff, 0),
         ).fetchone()
@@ -2264,11 +2284,11 @@ def admin_analytics(user):
         (1, "Pending", "Accepted", "Escalated"),
     ).fetchone()["count"]
     sos_response = db.execute(
-        """SELECT AVG((julianday(claimed_at)-julianday(created_at))*86400.0) AS average_seconds,
+        f"""SELECT {sos_response_average} AS average_seconds,
                   COUNT(*) AS response_count
            FROM help_requests
            WHERE is_sos=? AND claimed_at IS NOT NULL
-             AND julianday(claimed_at)>=julianday(created_at)""",
+             AND {sos_response_order}""",
         (1,),
     ).fetchone()
 
