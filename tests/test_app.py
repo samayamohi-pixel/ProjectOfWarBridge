@@ -16,6 +16,7 @@ os.environ["SECRET_KEY"] = "test-secret"
 os.environ["WARBRIDGE_ENV"] = "test"
 
 from app import app, get_db, init_db, normalize_origin, utcnow
+from structured_logging import JsonLogFormatter
 from werkzeug.security import generate_password_hash
 
 
@@ -61,6 +62,127 @@ class WarBridgeApiTests(unittest.TestCase):
     def test_public_resources_are_available(self):
         self.assertEqual(self.client.get("/api/public/alerts").status_code, 200)
         self.assertEqual(self.client.get("/api/public/shelters").status_code, 200)
+
+    def test_request_id_is_returned_and_invalid_values_are_replaced(self):
+        response = self.client.get(
+            "/api/health/live",
+            headers={"X-Request-ID": "123e4567-e89b-12d3-a456-426614174000"},
+        )
+        self.assertEqual(
+            response.headers["X-Request-ID"],
+            "123e4567-e89b-12d3-a456-426614174000",
+        )
+        self.assertIn("uptime_seconds", response.get_json())
+
+        invalid = self.client.get(
+            "/api/health/live",
+            headers={"X-Request-ID": "bad request id"},
+        )
+        self.assertNotEqual(invalid.headers["X-Request-ID"], "bad request id")
+        self.assertRegex(
+            invalid.headers["X-Request-ID"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+
+    def test_login_failure_has_safe_structured_log(self):
+        private_identity = "private-user@example.test"
+        private_password = "never-log-this-password"
+        with self.assertLogs("warbridge", level="WARNING") as captured:
+            response = self.client.post(
+                "/api/auth/login",
+                headers=self.csrf,
+                json={
+                    "identity": private_identity,
+                    "password": private_password,
+                    "role": "DISPLACED",
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        failure = next(
+            record
+            for record in captured.records
+            if getattr(record, "event", None) == "login_failed"
+        )
+        self.assertTrue(failure.request_id)
+        formatted = JsonLogFormatter().format(failure)
+        self.assertNotIn(private_identity, formatted)
+        self.assertNotIn(private_password, formatted)
+
+    def test_live_and_ready_health_checks(self):
+        with patch("app.init_db", side_effect=AssertionError("liveness queried database")):
+            live = self.client.get("/api/health/live")
+        self.assertEqual(live.status_code, 200)
+
+        ready = self.client.get("/api/health/ready")
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.get_json()["checks"]["database"], "ok")
+        self.assertEqual(ready.get_json()["checks"]["migrations"], "current")
+
+        with patch("app.init_db", side_effect=RuntimeError("database unavailable")):
+            unavailable = self.client.get("/api/health/ready")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.get_json()["status"], "not_ready")
+
+    def test_internal_metrics_requires_admin_and_returns_aggregate_metrics(self):
+        self.assertEqual(self.client.get("/api/internal/metrics").status_code, 401)
+
+        with patch("app.METRICS_TOKEN", "m" * 40):
+            token_response = self.client.get(
+                "/api/internal/metrics",
+                headers={"Authorization": f"Bearer {'m' * 40}"},
+            )
+        self.assertEqual(token_response.status_code, 200)
+
+        resident_id = self.create_user("DISPLACED")
+        self.authenticate(resident_id)
+        self.assertEqual(self.client.get("/api/internal/metrics").status_code, 403)
+
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        response = self.client.get("/api/internal/metrics")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("warbridge_users_total", response.text)
+        self.assertIn("warbridge_database_schema_version 3", response.text)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_not_found_error_handler_returns_correlation_id(self):
+        response = self.client.get(
+            "/path-that-does-not-exist",
+            headers={"X-Correlation-ID": "223e4567-e89b-12d3-a456-426614174001"},
+        )
+        self.assertEqual(response.status_code, 404)
+        request_id = "223e4567-e89b-12d3-a456-426614174001"
+        self.assertEqual(response.headers["X-Request-ID"], request_id)
+        self.assertEqual(response.get_json()["request_id"], request_id)
+
+    def test_sos_logs_exclude_private_submission_details(self):
+        private_values = (
+            "NeverLog Caller",
+            "private-phone-918273",
+            "private-location-Training-Address",
+            "private-message-SOS-content",
+        )
+        with self.assertLogs("warbridge", level="INFO") as captured:
+            response = self.client.post(
+                "/api/sos",
+                headers=self.csrf,
+                json={
+                    "name": private_values[0],
+                    "phone": private_values[1],
+                    "location": private_values[2],
+                    "message": private_values[3],
+                },
+            )
+        self.assertEqual(response.status_code, 201)
+        event = next(
+            record
+            for record in captured.records
+            if getattr(record, "event", None) == "sos_created"
+        )
+        formatted = JsonLogFormatter().format(event)
+        for value in private_values:
+            self.assertNotIn(value, formatted)
 
     def test_schema_migrations_preserve_existing_users(self):
         user_id = self.create_user("DISPLACED")
@@ -212,6 +334,8 @@ class WarBridgeApiTests(unittest.TestCase):
             )
         self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://preview.example")
         self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("Authorization", response.headers["Access-Control-Allow-Headers"])
+        self.assertEqual(response.headers["Access-Control-Expose-Headers"], "X-Request-ID")
         self.assertIn("frame-ancestors 'self' https://preview.example", response.headers["Content-Security-Policy"])
         self.assertNotIn("X-Frame-Options", response.headers)
 

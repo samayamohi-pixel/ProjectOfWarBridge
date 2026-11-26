@@ -63,6 +63,7 @@ class DatabaseBackupTests(unittest.TestCase):
             WARBRIDGE_BACKUP_ENCRYPTION_KEY="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
             WARBRIDGE_BACKUP_RETENTION_DAYS="30",
             WARBRIDGE_BACKUP_RETENTION_COUNT="14",
+            WARBRIDGE_LOG_LEVEL="INFO",
         )
         result = subprocess.run(
             [sys.executable, "db_backup.py", "backup", "--encrypt"],

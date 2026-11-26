@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import re
@@ -11,8 +12,24 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 
+logger = logging.getLogger("warbridge.database")
+
+
 class DatabaseIntegrityError(Exception):
     pass
+
+
+def _log_database_error(error, dialect, operation, level=logging.ERROR):
+    logger.log(
+        level,
+        "Database operation failed",
+        extra={
+            "event": "database_error",
+            "db_dialect": dialect,
+            "operation": operation,
+            "error_type": type(error).__name__,
+        },
+    )
 
 
 class CursorAdapter:
@@ -91,18 +108,27 @@ class Database:
                     dialect="sqlite",
                 )
             except sqlite3.IntegrityError as error:
+                _log_database_error(error, self.dialect, "execute", logging.WARNING)
                 raise DatabaseIntegrityError(str(error)) from error
+            except sqlite3.Error as error:
+                _log_database_error(error, self.dialect, "execute")
+                raise
 
         statement = sql.strip()
         if statement.upper() == "BEGIN IMMEDIATE":
             if self.connection.info.transaction_status == TransactionStatus.IDLE:
                 self.connection.execute("BEGIN")
             cursor = self.connection.cursor()
-            cursor.execute(
-                """LOCK TABLE users, shelters, accommodations, services, alerts,
-                   help_requests, reports, ratings, audit_log, rate_limit_events,
-                   schema_migrations IN SHARE ROW EXCLUSIVE MODE"""
-            )
+            try:
+                cursor.execute(
+                    """LOCK TABLE users, shelters, accommodations, services, alerts,
+                       help_requests, reports, ratings, audit_log, rate_limit_events,
+                       schema_migrations IN SHARE ROW EXCLUSIVE MODE"""
+                )
+            except psycopg.Error as error:
+                cursor.close()
+                _log_database_error(error, self.dialect, "transaction_lock")
+                raise
             return CursorAdapter(cursor, dialect="postgresql")
 
         match = re.match(r"INSERT\s+INTO\s+([a-z_]+)", statement, re.IGNORECASE)
@@ -119,7 +145,12 @@ class Database:
             cursor.execute(statement, params)
         except psycopg.IntegrityError as error:
             cursor.close()
+            _log_database_error(error, self.dialect, "execute", logging.WARNING)
             raise DatabaseIntegrityError(str(error)) from error
+        except psycopg.Error as error:
+            cursor.close()
+            _log_database_error(error, self.dialect, "execute")
+            raise
         return CursorAdapter(
             cursor,
             dialect="postgresql",
@@ -261,19 +292,27 @@ def _postgres_pool():
 
 
 def connect_database():
-    if DATABASE_URL:
-        pool = _postgres_pool()
-        connection = pool.getconn(timeout=DATABASE_CONNECTION_TIMEOUT)
-        return Database(connection, "postgresql", pool)
+    try:
+        if DATABASE_URL:
+            pool = _postgres_pool()
+            connection = pool.getconn(timeout=DATABASE_CONNECTION_TIMEOUT)
+            return Database(connection, "postgresql", pool)
 
-    SQLITE_DATABASE.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(
-        SQLITE_DATABASE,
-        timeout=DATABASE_CONNECTION_TIMEOUT,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute(
-        f"PRAGMA busy_timeout = {int(DATABASE_CONNECTION_TIMEOUT * 1000)}"
-    )
-    return Database(connection, "sqlite")
+        SQLITE_DATABASE.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            SQLITE_DATABASE,
+            timeout=DATABASE_CONNECTION_TIMEOUT,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            f"PRAGMA busy_timeout = {int(DATABASE_CONNECTION_TIMEOUT * 1000)}"
+        )
+        return Database(connection, "sqlite")
+    except Exception as error:
+        _log_database_error(
+            error,
+            "postgresql" if DATABASE_URL else "sqlite",
+            "connect",
+        )
+        raise

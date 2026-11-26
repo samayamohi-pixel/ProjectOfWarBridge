@@ -43,7 +43,7 @@ Displaced people, hosts, and NGOs can register through the sign-in form. Host an
 - NGO/host request handling; `POST /api/shelters`, `/api/accommodations`, `/api/services`, `GET /api/listings/mine`, `PATCH /api/listings/<type>/<id>`, and listing close/reopen actions
 - Alert create/edit/archive with expiry and type management; `POST /api/ratings` and `GET /api/ratings/mine` for completed shelter/host requests
 - Admin verification, listing moderation, reports, SOS monitoring, audit log, and Admin-only analytics via `GET /api/admin/analytics`
-- Health checks: `GET /api/health/live`, `GET /api/health/ready`
+- Health checks: `GET /api/health/live`, `GET /api/health/ready`; internal metrics: `GET /api/internal/metrics`
 
 Mutating API requests require the CSRF token from `GET /api/csrf`.
 
@@ -107,7 +107,7 @@ Generate a key once and store it outside the repository in a protected secret st
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-The log defaults to `warbridge-backup.log` in the backup directory; override it with `WARBRIDGE_BACKUP_LOG`. To test an archive without changing the live database, run:
+Backup commands emit structured JSON logs to the console and to `warbridge-backup.log` in the backup directory; override the file location with `WARBRIDGE_BACKUP_LOG`. To test an archive without changing the live database, run:
 
 ```powershell
 python db_backup.py verify --input D:\secure-backups\warbridge-backup-20261126T001200Z.sqlite3.enc
@@ -129,7 +129,15 @@ python db_backup.py --database .\warbridge.db restore --input D:\secure-backups\
 
 The backup utility is SQLite-only and refuses to run when PostgreSQL is configured. For PostgreSQL, use the managed provider's backup/restore tooling or PostgreSQL-native backups. Backups contain sensitive contact and SOS data; encrypt them and store them only in access-controlled, off-site storage. The code prepares local encrypted archives but does not connect to a cloud backup provider.
 
-The health endpoints provide basic liveness/readiness checks; production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
+### Logs and monitoring
+
+The application writes JSON structured logs to stdout. Set `WARBRIDGE_LOG_LEVEL` to `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, or `CRITICAL`. Each request gets a validated `X-Request-ID` (or `X-Correlation-ID`) and returns it in the `X-Request-ID` response header. Request logs include the method, path (not query string), status, and duration. Authentication, account-block, SOS lifecycle, listing moderation, report-decision, and database failure events use safe event fields; request bodies, passwords, CSRF tokens, contact details, addresses, and SOS text are not logged.
+
+`GET /api/health/live` is a database-independent process liveness check. `GET /api/health/ready` checks database connectivity and the current schema migration version. `GET /api/internal/metrics` returns aggregate Prometheus-format metrics and is Admin-only by default. To allow an internal scraper without an Admin session, configure a random `WARBRIDGE_METRICS_TOKEN` of at least 32 characters and send it as `Authorization: Bearer <token>`. Keep the endpoint on a private network or behind HTTPS and store the token in the monitoring service's secret store.
+
+Connect the JSON stdout stream and health/metrics endpoints to an external monitoring service such as your deployment platform's log collector and Prometheus-compatible scraper. Configure alerting for repeated database errors, non-2xx readiness checks, elevated 5xx responses, and unresolved SOS counts. Keep request-body and query-string logging disabled in proxies and monitoring agents as well; do not attach raw request/response payloads.
+
+Production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
 
 ### Embedded preview and session cookies
 

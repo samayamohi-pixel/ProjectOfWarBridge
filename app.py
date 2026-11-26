@@ -1,19 +1,58 @@
-import os
 import hashlib
+import logging
+import os
+import re
 import secrets
+import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from flask import Flask, g, jsonify, request, session
+from flask import Flask, Response, g, has_request_context, jsonify, request, session
+from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from database import DatabaseIntegrityError, connect_database
+from structured_logging import JsonLogFormatter, LOG_LEVELS, REQUEST_ID_CONTEXT
 
 
 APP_ENV = os.getenv("WARBRIDGE_ENV", "production").strip().lower()
+CURRENT_SCHEMA_VERSION = 3
+PROCESS_STARTED_AT = time.monotonic()
+REQUEST_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-"
+    r"[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
+)
+API_ERROR_MESSAGES = {
+    400: "Bad request",
+    401: "Authentication required",
+    403: "Forbidden",
+    404: "Not found",
+    409: "Conflict",
+    429: "Too many requests",
+    500: "Internal server error",
+}
 
 app = Flask(__name__)
+logger = logging.getLogger("warbridge")
+level_name = os.getenv("WARBRIDGE_LOG_LEVEL", "INFO").strip().upper()
+if level_name not in LOG_LEVELS:
+    raise RuntimeError("WARBRIDGE_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+if not any(getattr(handler, "_warbridge_json", False) for handler in logger.handlers):
+    log_handler = logging.StreamHandler(sys.stdout)
+    log_handler.setFormatter(JsonLogFormatter())
+    log_handler._warbridge_json = True
+    logger.addHandler(log_handler)
+logger.setLevel(LOG_LEVELS[level_name])
+logger.propagate = False
+app.logger.disabled = True
+logging.getLogger("werkzeug").disabled = True
+
+METRICS_TOKEN = os.getenv("WARBRIDGE_METRICS_TOKEN", "").strip() or None
+if METRICS_TOKEN and len(METRICS_TOKEN) < 32:
+    raise RuntimeError("WARBRIDGE_METRICS_TOKEN must be at least 32 characters")
+
 secret_key = os.getenv("SECRET_KEY")
 if not secret_key:
     if APP_ENV == "development":
@@ -104,6 +143,16 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
+def log_event(level, event, message, **fields):
+    if has_request_context():
+        fields.setdefault("request_id", getattr(g, "request_id", None))
+    logger.log(
+        level,
+        message,
+        extra={"event": event, **{key: value for key, value in fields.items() if value is not None}},
+    )
+
+
 def get_db():
     if "db" not in g:
         g.db = connect_database()
@@ -141,10 +190,26 @@ def security_headers(response):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-CSRF-Token"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, X-CSRF-Token, X-Request-ID, X-Correlation-ID, Authorization"
+        )
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
         response.vary.add("Origin")
     if APP_ENV not in ("development", "test"):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    request_id = getattr(g, "request_id", None)
+    if request_id:
+        response.headers["X-Request-ID"] = request_id
+        duration_ms = round((time.perf_counter() - g.request_started_at) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "http_request_completed",
+            "HTTP request completed",
+            method=request.method,
+            path=request.url_rule.rule if request.url_rule else "unmatched",
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
     return response
 
 
@@ -338,9 +403,64 @@ def init_db():
 
 @app.before_request
 def setup():
-    init_db()
+    request_id = request.headers.get("X-Request-ID") or request.headers.get("X-Correlation-ID")
+    if not request_id or not REQUEST_ID_PATTERN.fullmatch(request_id):
+        request_id = str(uuid.uuid4())
+    g.request_id = request_id
+    g.request_started_at = time.perf_counter()
+    g.request_id_context_token = REQUEST_ID_CONTEXT.set(request_id)
+    if request.endpoint not in ("health_live", "health_ready"):
+        init_db()
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_urlsafe(32)
+
+
+@app.teardown_request
+def clear_request_context(_error):
+    token = g.pop("request_id_context_token", None)
+    if token is not None:
+        REQUEST_ID_CONTEXT.reset(token)
+
+
+def api_error_response(status_code, message):
+    request_id = getattr(g, "request_id", None)
+    payload = {"error": message}
+    if request_id:
+        payload["request_id"] = request_id
+    return jsonify(payload), status_code
+
+
+def handle_http_error(error):
+    status_code = error.code or 500
+    original = getattr(error, "original_exception", None)
+    log_event(
+        logging.ERROR if status_code >= 500 else logging.WARNING,
+        "http_error",
+        "HTTP error response",
+        status_code=status_code,
+        error_type=type(original or error).__name__,
+    )
+    return api_error_response(
+        status_code,
+        API_ERROR_MESSAGES.get(status_code, "Request failed"),
+    )
+
+
+for error_status in (400, 401, 403, 404, 409, 429, 500):
+    app.register_error_handler(error_status, handle_http_error)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return handle_http_error(error)
+    log_event(
+        logging.ERROR,
+        "unhandled_exception",
+        "Unhandled request exception",
+        error_type=type(error).__name__,
+    )
+    return api_error_response(500, API_ERROR_MESSAGES[500])
 
 
 def require_csrf():
@@ -365,6 +485,14 @@ def role_required(*roles):
             if not user:
                 return jsonify({"error": "Authentication required"}), 401
             if user["blocked"]:
+                log_event(
+                    logging.WARNING,
+                    "account_blocked",
+                    "Blocked account access denied",
+                    user_id=user["id"],
+                    role=user["role"],
+                    outcome="denied",
+                )
                 return jsonify({"error": "Account blocked"}), 403
             if user["role"] not in roles:
                 return jsonify({"error": "Forbidden"}), 403
@@ -482,13 +610,134 @@ def csrf():
 
 @app.get("/api/health/live")
 def health_live():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": int(time.monotonic() - PROCESS_STARTED_AT),
+    })
 
 
 @app.get("/api/health/ready")
 def health_ready():
-    get_db().execute("SELECT 1").fetchone()
-    return jsonify({"status": "ready"})
+    try:
+        init_db()
+        db = get_db()
+        db.execute("SELECT 1").fetchone()
+        schema_version = db.execute(
+            "SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations"
+        ).fetchone()["version"]
+        if schema_version != CURRENT_SCHEMA_VERSION:
+            log_event(
+                logging.WARNING,
+                "readiness_check_failed",
+                "Database schema version is not current",
+                schema_version=schema_version,
+            )
+            return jsonify({
+                "status": "not_ready",
+                "checks": {"database": "ok", "migrations": "out_of_date"},
+            }), 503
+        return jsonify({
+            "status": "ready",
+            "checks": {"database": "ok", "migrations": "current"},
+            "schema_version": schema_version,
+        })
+    except Exception as error:
+        log_event(
+            logging.ERROR,
+            "readiness_check_failed",
+            "Database readiness check failed",
+            error_type=type(error).__name__,
+        )
+        return jsonify({
+            "status": "not_ready",
+            "checks": {"database": "unavailable", "migrations": "unknown"},
+        }), 503
+
+
+@app.get("/api/internal/metrics")
+def internal_metrics():
+    token = request.headers.get("Authorization", "")
+    token_authorized = bool(
+        METRICS_TOKEN
+        and secrets.compare_digest(token, f"Bearer {METRICS_TOKEN}")
+    )
+    if not token_authorized:
+        user = current_user()
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        if user["blocked"]:
+            log_event(
+                logging.WARNING,
+                "account_blocked",
+                "Blocked account attempted metrics access",
+                outcome="denied",
+                role=user["role"],
+            )
+            return jsonify({"error": "Account blocked"}), 403
+        if user["role"] != "ADMIN":
+            return jsonify({"error": "Forbidden"}), 403
+
+    db = get_db()
+    user_rows = db.execute(
+        "SELECT role,COUNT(*) AS count FROM users GROUP BY role"
+    ).fetchall()
+    user_counts = {row["role"]: row["count"] for row in user_rows}
+    request_rows = db.execute(
+        """SELECT status,COUNT(*) AS count FROM help_requests
+           WHERE is_sos=0 AND status IN ('Pending','Accepted')
+           GROUP BY status"""
+    ).fetchall()
+    request_counts = {row["status"]: row["count"] for row in request_rows}
+    unresolved_sos = db.execute(
+        """SELECT COUNT(*) AS count FROM help_requests
+           WHERE is_sos=1 AND status IN ('Pending','Accepted','Escalated')"""
+    ).fetchone()["count"]
+    open_reports = db.execute(
+        "SELECT COUNT(*) AS count FROM reports WHERE status='Open'"
+    ).fetchone()["count"]
+    schema_version = db.execute(
+        "SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations"
+    ).fetchone()["version"]
+
+    lines = [
+        "# HELP warbridge_users_total Registered users by role",
+        "# TYPE warbridge_users_total gauge",
+    ]
+    for role in ("DISPLACED", "HOST", "NGO", "ADMIN"):
+        lines.append(f'warbridge_users_total{{role="{role}"}} {user_counts.get(role, 0)}')
+    lines.extend((
+        "# HELP warbridge_active_requests Active non-SOS requests by status",
+        "# TYPE warbridge_active_requests gauge",
+    ))
+    for status in ("Pending", "Accepted"):
+        lines.append(
+            f'warbridge_active_requests{{status="{status.lower()}"}} '
+            f"{request_counts.get(status, 0)}"
+        )
+    lines.extend((
+        "# HELP warbridge_unresolved_sos_total Unresolved SOS requests",
+        "# TYPE warbridge_unresolved_sos_total gauge",
+        f"warbridge_unresolved_sos_total {unresolved_sos}",
+        "# HELP warbridge_open_reports_total Open reports",
+        "# TYPE warbridge_open_reports_total gauge",
+        f"warbridge_open_reports_total {open_reports}",
+        "# HELP warbridge_database_schema_version Applied schema version",
+        "# TYPE warbridge_database_schema_version gauge",
+        f"warbridge_database_schema_version {schema_version}",
+    ))
+    log_event(
+        logging.INFO,
+        "metrics_scraped",
+        "Internal metrics endpoint accessed",
+        outcome="authorized",
+        reason="token" if token_authorized else "admin",
+    )
+    response = Response(
+        "\n".join(lines) + "\n",
+        mimetype="text/plain; version=0.0.4",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/api/auth/register")
@@ -533,6 +782,12 @@ def login():
         return denied
     ip = request.remote_addr or "unknown"
     if not allow_rate_limited_attempt("login", ip, 5, 300):
+        log_event(
+            logging.WARNING,
+            "login_rate_limited",
+            "Login attempt was rate limited",
+            reason="rate_limit_exceeded",
+        )
         return jsonify({"error": "Too many login attempts. Try again later."}), 429
     data = request.get_json(silent=True) or {}
     identity = str(data.get("identity", "")).strip().lower()
@@ -549,16 +804,44 @@ def login():
     ).fetchall()
     matches = [user for user in users if check_password_hash(user["password_hash"], password)]
     if len(matches) > 1:
+        log_event(
+            logging.WARNING,
+            "login_failed",
+            "Login attempt matched multiple accounts",
+            reason="ambiguous_identity",
+        )
         return jsonify({"error": "This name matches multiple accounts. Sign in with the account email instead."}), 409
     if not matches:
+        log_event(
+            logging.WARNING,
+            "login_failed",
+            "Login attempt failed",
+            reason="invalid_credentials",
+        )
         return jsonify({"error": "Invalid name or password"}), 401
     user = matches[0]
     clear_rate_limited_attempts("login", ip)
     if user["blocked"]:
+        log_event(
+            logging.WARNING,
+            "account_blocked",
+            "Blocked account login denied",
+            user_id=user["id"],
+            role=user["role"],
+            outcome="denied",
+        )
         return jsonify({"error": "Account blocked"}), 403
     session.clear()
     session["user_id"] = user["id"]
     session["csrf_token"] = secrets.token_urlsafe(32)
+    log_event(
+        logging.INFO,
+        "login_succeeded",
+        "User authenticated",
+        user_id=user["id"],
+        role=user["role"],
+        outcome="allowed",
+    )
     return jsonify({"user": public_user(user), "csrfToken": session["csrf_token"]})
 
 
@@ -681,7 +964,22 @@ def create_sos():
             utcnow(),
         ),
     )
-    audit_and_commit(db, current_user()["id"] if current_user() else None, "sos_created", "help_request", cur.lastrowid)
+    actor = current_user()
+    audit_and_commit(
+        db,
+        actor["id"] if actor else None,
+        "sos_created",
+        "help_request",
+        cur.lastrowid,
+    )
+    log_event(
+        logging.INFO,
+        "sos_created",
+        "SOS request created",
+        target_type="help_request",
+        target_id=cur.lastrowid,
+        outcome="created",
+    )
     return jsonify({"ok": True, "id": cur.lastrowid}), 201
 
 
@@ -763,6 +1061,16 @@ def claim_sos(user, request_id):
         db.rollback()
         return jsonify({"error": "SOS request is no longer available to claim"}), 409
     audit_and_commit(db, user["id"], "sos_claimed", "help_request", request_id)
+    log_event(
+        logging.INFO,
+        "sos_claimed",
+        "SOS request claimed",
+        user_id=user["id"],
+        role=user["role"],
+        target_type="help_request",
+        target_id=request_id,
+        outcome="claimed",
+    )
     return jsonify({"ok": True, "status": "Accepted"})
 
 
@@ -807,6 +1115,17 @@ def update_sos(user, request_id, action):
             (status, now, request_id),
         )
     audit_and_commit(db, user["id"], f"sos_{action}d", "help_request", request_id)
+    log_event(
+        logging.INFO,
+        f"sos_{action}d",
+        f"SOS request {action}d",
+        user_id=user["id"],
+        role=user["role"],
+        target_type="help_request",
+        target_id=request_id,
+        action=action,
+        outcome=status.lower(),
+    )
     return jsonify({"ok": True, "status": status})
 
 
@@ -1399,6 +1718,15 @@ def create_report(user):
         db.rollback()
         return jsonify({"error": "You have already reported this listing"}), 409
     audit_and_commit(db, user["id"], "listing_reported", listing_type, listing_id)
+    log_event(
+        logging.INFO,
+        "report_submitted",
+        "Listing report submitted",
+        user_id=user["id"],
+        target_type=listing_type,
+        target_id=listing_id,
+        outcome="created",
+    )
     return jsonify({"id": cur.lastrowid}), 201
 
 
@@ -1666,6 +1994,17 @@ def moderate_listing(user, listing_type, listing_id, action):
         )
     audit_action = f"listing_{action}d" if action != "unblock" else "listing_unblocked"
     audit_and_commit(db, user["id"], audit_action, listing_type, listing_id)
+    log_event(
+        logging.INFO,
+        "listing_moderation",
+        "Listing moderation completed",
+        user_id=user["id"],
+        role=user["role"],
+        target_type=listing_type,
+        target_id=listing_id,
+        action=action,
+        outcome="completed",
+    )
     return jsonify({"ok": True})
 
 
@@ -1699,6 +2038,17 @@ def reject_user(user, user_id):
         return jsonify({"error": "Pending partner not found"}), 404
     db.execute("UPDATE users SET blocked=1 WHERE id=?", (user_id,))
     audit_and_commit(db, user["id"], "partner_rejected", "user", user_id)
+    log_event(
+        logging.WARNING,
+        "account_blocked",
+        "Partner account blocked by an administrator",
+        user_id=user["id"],
+        role="ADMIN",
+        target_type="user",
+        target_id=user_id,
+        action="reject",
+        outcome="blocked",
+    )
     return jsonify({"ok": True})
 
 
@@ -1728,6 +2078,17 @@ def handle_report(user, report_id, action):
         db.execute("UPDATE reports SET status='Dismissed',admin_id=?,updated_at=? WHERE id=?",
                    (user["id"], utcnow(), report_id))
     audit_and_commit(db, user["id"], f"listing_{action}", report["listing_type"], report["listing_id"])
+    log_event(
+        logging.INFO,
+        "report_decision",
+        "Report decision completed",
+        user_id=user["id"],
+        role=user["role"],
+        target_type=report["listing_type"],
+        target_id=report["listing_id"],
+        action=action,
+        outcome="completed",
+    )
     return jsonify({"ok": True})
 
 

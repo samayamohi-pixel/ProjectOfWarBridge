@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from structured_logging import JsonLogFormatter, LOG_LEVELS
 
 
 _BACKUP_MAGIC = b"WBK1"
@@ -180,7 +181,10 @@ def verify_backup_restore(backup, encryption_key=None):
             _decrypt_file(backup, source, key)
         restored = work_directory / "restored.sqlite3"
         _copy_database(source, restored)
-    logger.info("Backup restore verification passed: %s", backup)
+    logger.info(
+        "Backup restore verification passed",
+        extra={"event": "backup_restore_verification_passed"},
+    )
     return True
 
 
@@ -215,7 +219,10 @@ def backup_database(source, destination=None, encryption_key=None):
         except Exception:
             destination.unlink(missing_ok=True)
             raise
-        logger.info("Backup created and verified: %s", destination)
+        logger.info(
+            "Backup created and verified",
+            extra={"event": "backup_created"},
+        )
         return destination
     finally:
         temporary_database.unlink(missing_ok=True)
@@ -264,7 +271,10 @@ def restore_database(backup, destination, confirm=False, encryption_key=None):
             _publish_new_file(temporary, destination)
         installed = True
         _validate_database(destination)
-        logger.info("Database restored from %s to %s", backup, destination)
+        logger.info(
+            "Database restore completed",
+            extra={"event": "database_restore_completed"},
+        )
         return destination, safety_copy
     except Exception:
         if installed:
@@ -274,7 +284,13 @@ def restore_database(backup, destination, confirm=False, encryption_key=None):
                 elif not destination_existed:
                     destination.unlink(missing_ok=True)
             except OSError:
-                logger.exception("Could not roll back failed restore at %s", destination)
+                logger.error(
+                    "Could not roll back failed restore",
+                    extra={
+                        "event": "restore_rollback_failed",
+                        "error_type": "OSError",
+                    },
+                )
         raise
     finally:
         temporary.unlink(missing_ok=True)
@@ -311,7 +327,10 @@ def cleanup_backups(directory, retention_days=30, retention_count=14, now=None):
             continue
         path.unlink()
         deleted.append(path)
-        logger.info("Expired backup removed: %s", path)
+        logger.info(
+            "Expired backup removed",
+            extra={"event": "backup_retention_removed"},
+        )
     return deleted
 
 
@@ -336,6 +355,11 @@ def _selected_database_url():
 
 
 def _configure_logging(backup_directory):
+    level_name = os.getenv("WARBRIDGE_LOG_LEVEL", "INFO").strip().upper()
+    if level_name not in LOG_LEVELS:
+        raise ValueError(
+            "WARBRIDGE_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL"
+        )
     log_path = Path(
         os.getenv(
             "WARBRIDGE_BACKUP_LOG",
@@ -343,10 +367,12 @@ def _configure_logging(backup_directory):
         )
     ).expanduser().resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    handlers = (logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8"))
+    for handler in handlers:
+        handler.setFormatter(JsonLogFormatter())
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=(logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")),
+        level=LOG_LEVELS[level_name],
+        handlers=handlers,
         force=True,
     )
 
@@ -469,7 +495,13 @@ def main():
         if safety_copy:
             print(f"Previous database preserved at {safety_copy}")
     except Exception as error:
-        logger.exception("Backup operation failed")
+        logger.error(
+            "Backup operation failed",
+            extra={
+                "event": "backup_operation_failed",
+                "error_type": type(error).__name__,
+            },
+        )
         parser.exit(1, f"ERROR: {error}\n")
 
 
