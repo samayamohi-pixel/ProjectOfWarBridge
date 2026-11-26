@@ -9,7 +9,7 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import psycopg
 from psycopg import sql as pgsql
@@ -243,7 +243,9 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         parsed_url = urlsplit(database_url)
         query = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
         query["options"] = f"-c search_path={schema}"
-        target_url = urlunsplit(parsed_url._replace(query=urlencode(query)))
+        target_url = urlunsplit(
+            parsed_url._replace(query=urlencode(query, quote_via=quote))
+        )
 
         try:
             with tempfile.TemporaryDirectory() as directory:
