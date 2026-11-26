@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { api } from './api'
+import { api, ApiError } from './api'
 
 type IconName = 'home' | 'shield' | 'people' | 'bolt' | 'arrow' | 'bell' | 'chevron' | 'requests' | 'phone' | 'star' | 'report' | 'settings' | 'check' | 'clock' | 'bed' | 'medical' | 'alert' | 'megaphone' | 'user' | 'close' | 'search' | 'pin' | 'heart' | 'logout'
 const paths: Record<IconName, ReactNode> = {
@@ -102,6 +102,37 @@ type OwnedListing = {
   closed: number
 }
 type ApiRating = { listing_type: 'shelter' | 'accommodation'; listing_id: number; stars: number; comment: string | null }
+type AdminAnalytics = {
+  users: {
+    total: number
+    by_role: Record<'DISPLACED' | 'HOST' | 'NGO' | 'ADMIN', number>
+    partners: Record<'NGO' | 'HOST', { verified: number; pending: number }>
+  }
+  requests: {
+    by_status: Record<'pending' | 'accepted' | 'completed' | 'rejected' | 'cancelled', number>
+    active_by_status: { pending: number; accepted: number }
+    periods: Record<'last_7_days' | 'last_30_days' | 'last_90_days', { created: number; completed: number }>
+  }
+  listings: {
+    available_shelter_beds: number
+    available_accommodation_rooms: number
+    open_reports: number
+    blocked: number
+    pending: number
+  }
+  sos: {
+    unresolved: number
+    average_response_seconds: number | null
+    response_count: number
+  }
+  has_activity: boolean
+}
+type AdminAnalyticsState =
+  | { status: 'loading' }
+  | { status: 'empty'; data: AdminAnalytics }
+  | { status: 'ready'; data: AdminAnalytics }
+  | { status: 'error'; message: string }
+  | { status: 'unauthorized' }
 const localDateTimeInput = (value: string | null) => {
   if (!value) return ''
   const date = new Date(value)
@@ -155,6 +186,7 @@ export default function App() {
   const [adminReports, setAdminReports] = useState<{ id: number; listing_type: string; listing_id: number; reason: string }[]>([])
   const [pendingListings, setPendingListings] = useState<{ id: number; listing_type: string; label: string; owner_name: string }[]>([])
   const [blockedListings, setBlockedListings] = useState<{ id: number; listing_type: string; label: string; owner_name: string }[]>([])
+  const [adminAnalytics, setAdminAnalytics] = useState<AdminAnalyticsState>({ status: 'loading' })
   const modalRef = useRef<HTMLElement>(null)
   useEffect(() => {
     if (!modal) return
@@ -185,8 +217,24 @@ export default function App() {
     }
   }, [modal])
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 4500) }
+  const loadAdminAnalytics = () => {
+    setAdminAnalytics({ status: 'loading' })
+    void api.get<AdminAnalytics>('/api/admin/analytics')
+      .then(data => setAdminAnalytics({ status: data.has_activity ? 'ready' : 'empty', data }))
+      .catch(error => {
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          setAdminAnalytics({ status: 'unauthorized' })
+          return
+        }
+        setAdminAnalytics({
+          status: 'error',
+          message: error instanceof Error ? error.message : 'Could not load platform analytics.',
+        })
+      })
+  }
   const loadRoleData = (user: AuthUser) => {
     if (user.role === 'ADMIN') {
+      loadAdminAnalytics()
       void Promise.all([
         api.get<{ users: VerificationItem[] }>('/api/admin/verifications'),
         api.get<{ audit: AuditEntry[] }>('/api/admin/audit'),
@@ -570,6 +618,90 @@ export default function App() {
   function Helplines({ full = false }: { full?: boolean }) {
     return <div className={`helpline-list ${full ? 'full' : ''}`}>{([{ name: 'Women Helpline', number: '181', icon: 'phone' }, { name: 'Emergency Response', number: '112', icon: 'phone' }, { name: 'Child Helpline', number: '1098', icon: 'shield' }] as { name: string; number: string; icon: IconName }[]).map(item => <a key={item.number} href={`tel:${item.number}`}><span className="helpline-icon"><Icon name={item.icon} size={22}/></span><span>{item.name}<strong>{item.number}</strong></span></a>)}</div>
   }
+  const renderAdminAnalytics = () => {
+    if (adminAnalytics.status === 'loading') {
+      return <p className="analytics-state" role="status">Loading platform analytics…</p>
+    }
+    if (adminAnalytics.status === 'unauthorized') {
+      return <p className="analytics-state analytics-error" role="alert">Administrator access is required to view analytics. Sign in with an admin account.</p>
+    }
+    if (adminAnalytics.status === 'error') {
+      return <div className="analytics-state analytics-error" role="alert"><p>{adminAnalytics.message}</p><button className="outline-button" onClick={loadAdminAnalytics}>Try again</button></div>
+    }
+
+    const data = adminAnalytics.data
+    const metric = (label: string, value: ReactNode, detail?: string) => (
+      <div className="analytics-metric" key={label}>
+        <span>{label}</span>
+        <strong>{value}</strong>
+        {detail && <small>{detail}</small>}
+      </div>
+    )
+    const averageResponse = data.sos.average_response_seconds === null
+      ? 'No claimed SOS yet'
+      : data.sos.average_response_seconds < 60
+        ? `${data.sos.average_response_seconds.toLocaleString()} sec`
+        : `${(data.sos.average_response_seconds / 60).toFixed(1)} min`
+
+    return <>
+      {adminAnalytics.status === 'empty' && <p className="analytics-state" role="status">No platform activity recorded yet. Metrics will update as users and requests are added.</p>}
+      <div className="analytics-grid">
+        <section className="analytics-section">
+          <h4>Users & partners</h4>
+          <div className="analytics-metrics">
+            {metric('Total users', data.users.total)}
+            {metric('Displaced people', data.users.by_role.DISPLACED)}
+            {metric('NGOs', data.users.by_role.NGO, `${data.users.partners.NGO.verified} verified · ${data.users.partners.NGO.pending} pending`)}
+            {metric('Hosts', data.users.by_role.HOST, `${data.users.partners.HOST.verified} verified · ${data.users.partners.HOST.pending} pending`)}
+            {metric('Administrators', data.users.by_role.ADMIN)}
+          </div>
+        </section>
+        <section className="analytics-section">
+          <h4>Requests by status</h4>
+          <div className="analytics-metrics">
+            {metric('Pending', data.requests.active_by_status.pending)}
+            {metric('Accepted', data.requests.active_by_status.accepted)}
+            {metric('Completed', data.requests.by_status.completed)}
+            {metric('Rejected', data.requests.by_status.rejected)}
+            {metric('Cancelled', data.requests.by_status.cancelled)}
+          </div>
+        </section>
+        <section className="analytics-section">
+          <h4>Capacity & trust</h4>
+          <div className="analytics-metrics">
+            {metric('Available shelter beds', data.listings.available_shelter_beds)}
+            {metric('Available host rooms', data.listings.available_accommodation_rooms)}
+            {metric('Open reports', data.listings.open_reports)}
+            {metric('Blocked listings', data.listings.blocked)}
+            {metric('Pending listings', data.listings.pending)}
+          </div>
+        </section>
+        <section className="analytics-section">
+          <h4>SOS response</h4>
+          <div className="analytics-metrics">
+            {metric('Unresolved SOS', data.sos.unresolved)}
+            {metric('Average response', averageResponse, `${data.sos.response_count} claimed SOS requests`)}
+          </div>
+        </section>
+        <section className="analytics-section analytics-period-section">
+          <h4>Requests created & completed</h4>
+          <div className="analytics-periods">
+            {([
+              ['Last 7 days', data.requests.periods.last_7_days],
+              ['Last 30 days', data.requests.periods.last_30_days],
+              ['Last 90 days', data.requests.periods.last_90_days],
+            ] as const).map(([label, period]) => (
+              <div className="analytics-period" key={label}>
+                <strong>{label}</strong>
+                <span>{period.created} created</span>
+                <span>{period.completed} completed</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </>
+  }
 
   return <div className="app-shell">
     <header className="view-header"><nav className="view-navigation" aria-label="WarBridge pages">{views.map(item => <button key={item.id} aria-pressed={view === item.id} className={view === item.id ? 'current-view' : ''} onClick={() => navigateView(item.id)}>{item.label}</button>)}</nav><span className="preview-label"><span className="live-dot"/> WarBridge</span></header>
@@ -654,7 +786,10 @@ export default function App() {
           : adminTab === 'Reports' ? adminReports.length ? adminReports.map(report => <div className="verification-row" key={report.id}><div className="org-info"><strong>{report.listing_type} #{report.listing_id}</strong><small>{report.reason}</small></div><button className="approve-button" onClick={() => decideReport(report.id, 'block')}>Block listing</button><button className="outline-button" onClick={() => decideReport(report.id, 'dismiss')}>Dismiss</button></div>) : <div className="empty-state">No open reports.</div>
           : adminTab === 'Blocked Listings' ? blockedListings.length ? blockedListings.map(listing => <div className="verification-row" key={`${listing.listing_type}-${listing.id}`}><div className="org-info"><strong>{listing.label}</strong><small>{listing.listing_type} · {listing.owner_name}</small></div><button className="outline-button" onClick={() => moderateListing(listing, 'unblock')}>Unblock</button></div>) : <div className="empty-state">No blocked listings.</div>
           : adminSos.length ? adminSos.map(item => <div className="verification-row" key={item.id}><div className="org-info"><strong>Emergency request #{item.id}</strong><small>{item.status} · {item.time}</small></div><button className="outline-button" onClick={() => open('sos-queue')}>Monitor queue</button></div>) : <div className="empty-state">No unresolved SOS requests.</div>}</div></div><div className="surface activity"><div className="section-heading"><h3>Recent Activity</h3><button className="text-link" onClick={() => open('audit')}>View all <Icon name="arrow" size={11}/></button></div>{auditEntries.length ? auditEntries.slice(0, 5).map((entry, index) => <p className="audit-row" key={`${entry.action}-${entry.target_id}-${index}`}>{entry.action} · {entry.target_type || 'system'} {entry.target_id ? `#${entry.target_id}` : ''}</p>) : <p className="empty-state">No administrative activity recorded.</p>}</div></div>
-        <div className="surface chart-card"><div className="section-heading"><h3>Platform Overview</h3></div><p className="empty-state">Analytics will appear after platform activity is recorded.</p></div>
+        <section className="surface analytics-panel" aria-label="Platform analytics">
+          <div className="analytics-heading"><div><h3>Platform Analytics</h3><p>Live counts for users, requests, listings, and SOS.</p></div><button className="outline-button" disabled={adminAnalytics.status === 'loading'} onClick={loadAdminAnalytics}>Refresh</button></div>
+          {renderAdminAnalytics()}
+        </section>
       </div>
     </section>
 

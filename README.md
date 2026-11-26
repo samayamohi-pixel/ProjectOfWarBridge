@@ -42,7 +42,7 @@ Displaced people, hosts, and NGOs can register through the sign-in form. Host an
 - Verified NGO SOS queue: `GET /api/sos/incoming`, `POST /api/sos/<id>/claim`, `POST /api/sos/<id>/escalate`, `POST /api/sos/<id>/resolve`
 - NGO/host request handling; `POST /api/shelters`, `/api/accommodations`, `/api/services`, `GET /api/listings/mine`, `PATCH /api/listings/<type>/<id>`, and listing close/reopen actions
 - Alert create/edit/archive with expiry and type management; `POST /api/ratings` and `GET /api/ratings/mine` for completed shelter/host requests
-- Admin verification, listing moderation, reports, SOS monitoring, and audit log
+- Admin verification, listing moderation, reports, SOS monitoring, audit log, and Admin-only analytics via `GET /api/admin/analytics`
 - Health checks: `GET /api/health/live`, `GET /api/health/ready`
 
 Mutating API requests require the CSRF token from `GET /api/csrf`.

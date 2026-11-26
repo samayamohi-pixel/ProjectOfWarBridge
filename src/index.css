@@ -674,3 +674,30 @@ h3 { font-size: 12px; font-weight: 650; letter-spacing: -.25px; }
   .page-layout .helplines-card .helpline-list { flex-direction: row; flex-wrap: wrap; gap: 12px; }
   .page-layout .helplines-card .helpline-list a { font-size: 8px; }
 }
+
+.analytics-panel { margin-top: 12px; padding: 18px; }
+.analytics-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.analytics-heading h3 { font-size: 17px; }
+.analytics-heading p { color: #aebbdb; font-size: 11px; margin-top: 4px; }
+.analytics-heading .outline-button { flex-shrink: 0; }
+.analytics-state { margin: 14px 0 0; padding: 12px; border: 1px solid #5184cb29; border-radius: 8px; color: #c6d3ed; font-size: 12px; line-height: 1.6; }
+.analytics-state.analytics-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #ffd2dc; border-color: #ef416c55; background: #59112633; }
+.analytics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-top: 14px; }
+.analytics-section { min-width: 0; padding: 14px; border: 1px solid #5184cb29; border-radius: 9px; background: #0a1429a8; }
+.analytics-section h4 { margin: 0 0 11px; color: #dce8ff; font-size: 12px; font-weight: 650; }
+.analytics-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.analytics-metric { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 9px; border-radius: 7px; background: #101e38a8; }
+.analytics-metric > span { color: #aebbdb; font-size: 9px; line-height: 1.4; }
+.analytics-metric > strong { color: #f3f6ff; font-size: 17px; line-height: 1.2; overflow-wrap: anywhere; }
+.analytics-metric > small { color: #8ea1c3; font-size: 8px; line-height: 1.5; }
+.analytics-period-section { grid-column: 1 / -1; }
+.analytics-periods { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.analytics-period { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px; border-radius: 7px; background: #101e38a8; color: #b8c6e4; font-size: 10px; }
+.analytics-period strong { width: 100%; color: #f3f6ff; font-size: 11px; }
+@media (max-width: 600px) {
+  .analytics-panel { padding: 12px; }
+  .analytics-grid { grid-template-columns: 1fr; }
+  .analytics-period-section { grid-column: auto; }
+  .analytics-periods { grid-template-columns: 1fr; }
+  .analytics-state.analytics-error { align-items: flex-start; flex-direction: column; }
+}

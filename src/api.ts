@@ -1,5 +1,12 @@
 let csrfToken: string | null = null
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 async function ensureCsrf() {
   if (!csrfToken) {
     const response = await fetch('/api/csrf', { credentials: 'include' })
@@ -12,7 +19,7 @@ async function ensureCsrf() {
 
 async function readResponse(response: Response) {
   const data = await response.json().catch(() => ({ error: 'Unexpected server response' }))
-  if (!response.ok) throw new Error(data.error || 'Request failed')
+  if (!response.ok) throw new ApiError(data.error || 'Request failed', response.status)
   return data
 }
 

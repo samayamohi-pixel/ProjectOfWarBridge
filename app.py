@@ -1486,6 +1486,145 @@ def admin_reports(user):
     return jsonify({"reports": [json_row(row) for row in rows]})
 
 
+@app.get("/api/admin/analytics")
+@role_required("ADMIN")
+def admin_analytics(user):
+    db = get_db()
+    role_counts = {role: 0 for role in ("DISPLACED", "HOST", "NGO", "ADMIN")}
+    for row in db.execute("SELECT role,COUNT(*) AS count FROM users GROUP BY role"):
+        role_counts[row["role"]] = row["count"]
+
+    partner_counts = {
+        role: {"verified": 0, "pending": 0}
+        for role in ("NGO", "HOST")
+    }
+    for row in db.execute(
+        """SELECT role,verified,COUNT(*) AS count FROM users
+           WHERE role IN (?,?) AND blocked=? GROUP BY role,verified""",
+        ("NGO", "HOST", 0),
+    ):
+        partner_counts[row["role"]]["verified" if row["verified"] else "pending"] = row["count"]
+
+    request_status = {
+        status: 0
+        for status in ("pending", "accepted", "completed", "rejected", "cancelled")
+    }
+    for row in db.execute(
+        """SELECT LOWER(status) AS status,COUNT(*) AS count FROM help_requests
+           WHERE is_sos=? GROUP BY LOWER(status)""",
+        (0,),
+    ):
+        if row["status"] in request_status:
+            request_status[row["status"]] = row["count"]
+
+    request_periods = {}
+    for days in (7, 30, 90):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        row = db.execute(
+            """SELECT
+                   SUM(CASE WHEN julianday(created_at)>=julianday(?) THEN 1 ELSE 0 END) AS created,
+                   SUM(CASE WHEN status=? AND julianday(updated_at)>=julianday(?) THEN 1 ELSE 0 END) AS completed
+               FROM help_requests WHERE is_sos=?""",
+            (cutoff, "Completed", cutoff, 0),
+        ).fetchone()
+        request_periods[f"last_{days}_days"] = {
+            "created": row["created"] or 0,
+            "completed": row["completed"] or 0,
+        }
+
+    available_beds = db.execute(
+        """SELECT COALESCE(SUM(s.beds_available),0) AS count FROM shelters s
+           JOIN users u ON u.id=s.ngo_id
+           WHERE s.verified=? AND s.blocked=? AND s.closed=?
+             AND u.verified=? AND u.blocked=?""",
+        (1, 0, 0, 1, 0),
+    ).fetchone()["count"]
+    available_rooms = db.execute(
+        """SELECT COALESCE(SUM(a.rooms_available),0) AS count FROM accommodations a
+           JOIN users u ON u.id=a.host_id
+           WHERE a.verified=? AND a.blocked=? AND a.closed=?
+             AND u.verified=? AND u.blocked=?""",
+        (1, 0, 0, 1, 0),
+    ).fetchone()["count"]
+    open_reports = db.execute(
+        "SELECT COUNT(*) AS count FROM reports WHERE status=?",
+        ("Open",),
+    ).fetchone()["count"]
+
+    blocked_listings = db.execute(
+        """SELECT
+               (SELECT COUNT(*) FROM shelters WHERE blocked=?)
+             + (SELECT COUNT(*) FROM accommodations WHERE blocked=?)
+             + (SELECT COUNT(*) FROM services WHERE blocked=?) AS count""",
+        (1, 1, 1),
+    ).fetchone()["count"]
+    pending_listings = db.execute(
+        """SELECT
+               (SELECT COUNT(*) FROM shelters WHERE verified=? AND blocked=?)
+             + (SELECT COUNT(*) FROM accommodations WHERE verified=? AND blocked=?)
+             + (SELECT COUNT(*) FROM services WHERE verified=? AND blocked=?) AS count""",
+        (0, 0, 0, 0, 0, 0),
+    ).fetchone()["count"]
+
+    unresolved_sos = db.execute(
+        """SELECT COUNT(*) AS count FROM help_requests
+           WHERE is_sos=? AND status IN (?,?,?)""",
+        (1, "Pending", "Accepted", "Escalated"),
+    ).fetchone()["count"]
+    sos_response = db.execute(
+        """SELECT AVG((julianday(claimed_at)-julianday(created_at))*86400.0) AS average_seconds,
+                  COUNT(*) AS response_count
+           FROM help_requests
+           WHERE is_sos=? AND claimed_at IS NOT NULL
+             AND julianday(claimed_at)>=julianday(created_at)""",
+        (1,),
+    ).fetchone()
+
+    has_activity = (
+        any(role_counts[role] for role in ("DISPLACED", "HOST", "NGO"))
+        or any(request_status.values())
+        or available_beds > 0
+        or available_rooms > 0
+        or open_reports > 0
+        or blocked_listings > 0
+        or pending_listings > 0
+        or unresolved_sos > 0
+        or sos_response["response_count"] > 0
+    )
+    return jsonify({
+        "users": {
+            "total": sum(role_counts.values()),
+            "by_role": role_counts,
+            "partners": partner_counts,
+        },
+        "requests": {
+            "by_status": request_status,
+            "active_by_status": {
+                "pending": request_status["pending"],
+                "accepted": request_status["accepted"],
+            },
+            "periods": request_periods,
+        },
+        "listings": {
+            "available_shelter_beds": available_beds,
+            "available_accommodation_rooms": available_rooms,
+            "open_reports": open_reports,
+            "blocked": blocked_listings,
+            "pending": pending_listings,
+        },
+        "sos": {
+            "unresolved": unresolved_sos,
+            "average_response_seconds": (
+                round(sos_response["average_seconds"], 1)
+                if sos_response["average_seconds"] is not None
+                else None
+            ),
+            "response_count": sos_response["response_count"],
+        },
+        "has_activity": bool(has_activity),
+    })
+
+
 @app.post("/api/admin/listings/<listing_type>/<int:listing_id>/<action>")
 @role_required("ADMIN")
 def moderate_listing(user, listing_type, listing_id, action):

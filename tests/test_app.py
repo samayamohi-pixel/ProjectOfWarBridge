@@ -62,6 +62,127 @@ class WarBridgeApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/public/alerts").status_code, 200)
         self.assertEqual(self.client.get("/api/public/shelters").status_code, 200)
 
+    def test_admin_analytics_requires_admin_role(self):
+        self.assertEqual(self.client.get("/api/admin/analytics").status_code, 401)
+
+        displaced_id = self.create_user("DISPLACED")
+        self.authenticate(displaced_id)
+        self.assertEqual(self.client.get("/api/admin/analytics").status_code, 403)
+
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        response = self.client.get("/api/admin/analytics")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("users", response.get_json())
+
+    def test_admin_analytics_aggregates_platform_metrics_and_periods(self):
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        baseline_response = self.client.get("/api/admin/analytics")
+        self.assertEqual(baseline_response.status_code, 200)
+        baseline = baseline_response.get_json()
+
+        ngo_id = self.create_user("NGO")
+        pending_ngo_id = self.create_user("NGO", verified=False)
+        host_id = self.create_user("HOST")
+        pending_host_id = self.create_user("HOST", verified=False)
+        resident_id = self.create_user("DISPLACED")
+        shelter_id = self.create_shelter(ngo_id, beds=4)
+        now = datetime.now(timezone.utc)
+        created_at = (now - timedelta(days=1)).isoformat()
+        completed_at = (now - timedelta(hours=12)).isoformat()
+        sos_created_at = (now - timedelta(minutes=10)).isoformat()
+        sos_claimed_at = (now - timedelta(minutes=8)).isoformat()
+
+        with app.app_context():
+            db = get_db()
+            accommodation = db.execute(
+                """INSERT INTO accommodations(
+                       host_id,city,area,rooms,rooms_available,verified,updated_at
+                   ) VALUES(?,?,?,?,?,1,?)""",
+                (host_id, "Test City", "Test Area", 2, 2, utcnow()),
+            )
+            db.execute(
+                """INSERT INTO shelters(
+                       ngo_id,name,city,area,beds_available,verified,updated_at
+                   ) VALUES(?,?,?,?,?,0,?)""",
+                (pending_ngo_id, "Pending Shelter", "Test City", "Test Area", 2, utcnow()),
+            )
+            db.execute(
+                """INSERT INTO services(
+                       ngo_id,name,category,city,verified,blocked,closed,updated_at
+                   ) VALUES(?,?,?,?,1,1,0,?)""",
+                (ngo_id, "Blocked Service", "Food", "Test City", utcnow()),
+            )
+            db.execute(
+                """INSERT INTO accommodations(
+                       host_id,city,area,rooms,rooms_available,verified,updated_at
+                   ) VALUES(?,?,?,?,?,0,?)""",
+                (pending_host_id, "Test City", "Pending Area", 1, 1, utcnow()),
+            )
+
+            for status in ("Pending", "Accepted", "Completed", "Rejected", "Cancelled"):
+                updated_at = completed_at if status == "Completed" else created_at
+                db.execute(
+                    """INSERT INTO help_requests(
+                           requester_id,shelter_id,type,status,updated_at,created_at
+                       ) VALUES(?,?, 'shelter',?,?,?)""",
+                    (resident_id, shelter_id, status, updated_at, created_at),
+                )
+            db.execute(
+                """INSERT INTO help_requests(
+                       type,requester_name,contact,location_text,status,is_sos,
+                       claimed_by,claimed_at,updated_at,created_at
+                   ) VALUES('SOS','Demo Caller','000-000-0000','Test Area',
+                            'Accepted',1,?,?,?,?)""",
+                (ngo_id, sos_claimed_at, sos_claimed_at, sos_created_at),
+            )
+            db.execute(
+                """INSERT INTO help_requests(
+                       type,requester_name,contact,location_text,status,is_sos,
+                       updated_at,created_at
+                   ) VALUES('SOS','Demo Caller','000-000-0000','Test Area',
+                            'Pending',1,?,?)""",
+                (sos_created_at, sos_created_at),
+            )
+            db.execute(
+                """INSERT INTO reports(
+                       reporter_id,listing_type,listing_id,reason,status,updated_at,created_at
+                   ) VALUES(?,?,?,'Test report','Open',?,?)""",
+                (resident_id, "shelter", shelter_id, utcnow(), utcnow()),
+            )
+            db.commit()
+
+        result_response = self.client.get("/api/admin/analytics")
+        self.assertEqual(result_response.status_code, 200)
+        result = result_response.get_json()
+        self.assertEqual(result["users"]["total"], baseline["users"]["total"] + 5)
+        self.assertEqual(
+            result["users"]["by_role"]["DISPLACED"],
+            baseline["users"]["by_role"]["DISPLACED"] + 1,
+        )
+        self.assertEqual(result["users"]["partners"]["NGO"]["verified"], baseline["users"]["partners"]["NGO"]["verified"] + 1)
+        self.assertEqual(result["users"]["partners"]["NGO"]["pending"], baseline["users"]["partners"]["NGO"]["pending"] + 1)
+        self.assertEqual(result["users"]["partners"]["HOST"]["verified"], baseline["users"]["partners"]["HOST"]["verified"] + 1)
+        self.assertEqual(result["users"]["partners"]["HOST"]["pending"], baseline["users"]["partners"]["HOST"]["pending"] + 1)
+        for status in ("pending", "accepted", "completed", "rejected", "cancelled"):
+            self.assertEqual(
+                result["requests"]["by_status"][status],
+                baseline["requests"]["by_status"][status] + 1,
+            )
+        self.assertEqual(result["listings"]["available_shelter_beds"], baseline["listings"]["available_shelter_beds"] + 4)
+        self.assertEqual(result["listings"]["available_accommodation_rooms"], baseline["listings"]["available_accommodation_rooms"] + 2)
+        self.assertEqual(result["listings"]["open_reports"], baseline["listings"]["open_reports"] + 1)
+        self.assertEqual(result["listings"]["blocked"], baseline["listings"]["blocked"] + 1)
+        self.assertEqual(result["listings"]["pending"], baseline["listings"]["pending"] + 2)
+        self.assertEqual(result["sos"]["unresolved"], baseline["sos"]["unresolved"] + 2)
+        self.assertEqual(result["sos"]["response_count"], baseline["sos"]["response_count"] + 1)
+        self.assertAlmostEqual(result["sos"]["average_response_seconds"], 120, delta=1)
+        self.assertTrue(result["has_activity"])
+        for period in ("last_7_days", "last_30_days", "last_90_days"):
+            self.assertEqual(result["requests"]["periods"][period]["created"], baseline["requests"]["periods"][period]["created"] + 5)
+            self.assertEqual(result["requests"]["periods"][period]["completed"], baseline["requests"]["periods"][period]["completed"] + 1)
+
     def test_preview_security_headers_use_explicit_embedding_allowlists(self):
         with patch("app.FRAME_ANCESTORS", ("'self'", "https://preview.example")), patch(
             "app.ALLOWED_CORS_ORIGINS", ("https://preview.example",)
