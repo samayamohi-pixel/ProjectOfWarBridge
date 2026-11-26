@@ -525,6 +525,93 @@ class WarBridgeApiTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 400)
 
+    def test_registration_requires_csrf(self):
+        response = self.client.post(
+            "/api/auth/register",
+            json={
+                "name": "Test user",
+                "email": f"{uuid.uuid4().hex}@example.test",
+                "password": "strong-password-12",
+                "role": "DISPLACED",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_login_rate_limit_rejects_attempts_after_limit(self):
+        responses = [
+            self.client.post(
+                "/api/auth/login",
+                headers=self.csrf,
+                json={
+                    "identity": f"unknown-{index}@example.test",
+                    "password": "incorrect-password",
+                    "role": "DISPLACED",
+                },
+            )
+            for index in range(5)
+        ]
+        self.assertTrue(all(response.status_code == 401 for response in responses))
+
+        limited = self.client.post(
+            "/api/auth/login",
+            headers=self.csrf,
+            json={
+                "identity": "another-unknown@example.test",
+                "password": "incorrect-password",
+                "role": "DISPLACED",
+            },
+        )
+        self.assertEqual(limited.status_code, 429)
+
+    def test_blocked_user_cannot_use_an_existing_session(self):
+        user_id = self.create_user("DISPLACED")
+        self.authenticate(user_id)
+        with app.app_context():
+            get_db().execute("UPDATE users SET blocked=1 WHERE id=?", (user_id,))
+            get_db().commit()
+
+        protected = self.client.get("/api/requests/mine")
+        self.assertEqual(protected.status_code, 403)
+        self.assertEqual(protected.get_json()["error"], "Account blocked")
+
+    def test_cors_rejects_unallowlisted_origins(self):
+        with patch("app.ALLOWED_CORS_ORIGINS", ("https://allowed.example",)):
+            response = self.client.options(
+                "/api/csrf",
+                headers={
+                    "Origin": "https://untrusted.example",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+
+    def test_non_admin_cannot_access_admin_mutations(self):
+        ngo_id = self.create_user("NGO")
+        self.authenticate(ngo_id)
+        response = self.client.post(
+            "/api/admin/listings/shelter/1/approve",
+            headers=self.csrf,
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_public_shelters_do_not_expose_private_contact_details(self):
+        ngo_id = self.create_user("NGO")
+        shelter_id = self.create_shelter(ngo_id)
+        with app.app_context():
+            get_db().execute(
+                "UPDATE shelters SET address=?,phone=? WHERE id=?",
+                ("Private street address", "555-0188", shelter_id),
+            )
+            get_db().commit()
+
+        response = self.client.get("/api/public/shelters")
+        shelter = next(
+            item for item in response.get_json()["shelters"]
+            if item["id"] == shelter_id
+        )
+        self.assertNotIn("address", shelter)
+        self.assertNotIn("phone", shelter)
+
     def test_request_body_size_limit_returns_json_error(self):
         response = self.client.post(
             "/api/auth/register",

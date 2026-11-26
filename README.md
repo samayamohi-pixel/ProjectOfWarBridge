@@ -95,11 +95,15 @@ python run_tests.py
 node --test tests/frontend-localization.test.mjs
 npx tsc --noEmit
 pnpm install --frozen-lockfile
+pnpm exec playwright install chromium
+pnpm test:e2e
 pnpm build
 docker compose down -v
 ```
 
 `run_tests.py` fails if any test is skipped, including PostgreSQL tests. Keep the PostgreSQL service running while executing the commands; `docker compose down -v` removes the disposable container and its data when finished. GitHub Actions runs the same PostgreSQL integration tests and checks against its own disposable PostgreSQL service.
+
+The Playwright suite starts its own temporary SQLite backend and generates ephemeral test accounts and administrator credentials for each run. It does not use real credentials or connect to a production database.
 
 To preserve records when moving an existing SQLite demo database to a new, empty PostgreSQL database, set the PostgreSQL target URL and run the importer before switching the application over:
 
@@ -213,6 +217,7 @@ The Make environment already manages the preview server.
 - `pnpm format` — project formatter
 - `python run_tests.py` — backend regression tests; fails on skipped tests
 - `node --test tests/frontend-localization.test.mjs` — localization behavior and English-key coverage
+- `pnpm test:e2e` — Playwright user workflows, accessibility, responsive, reduced-motion, and RTL checks
 - `npx tsc --noEmit` — frontend type check
 
 Copy `.env.example` to a local, untracked environment file or set the variables in your shell. The sample contains placeholders only; do not commit a real secret or recipient address.

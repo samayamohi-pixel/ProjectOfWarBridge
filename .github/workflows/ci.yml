@@ -64,6 +64,12 @@ jobs:
       - name: Run frontend localization tests
         run: node --test tests/frontend-localization.test.mjs
 
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run frontend E2E, accessibility, and keyboard tests
+        run: pnpm test:e2e
+
       - name: Type-check frontend
         run: npx tsc --noEmit
 
