@@ -1,19 +1,16 @@
 import os
 import hashlib
 import secrets
-import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from urllib.parse import urlsplit
 
 from flask import Flask, g, jsonify, request, session
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
+from database import DatabaseIntegrityError, connect_database
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE = Path(os.getenv("WARBRIDGE_DB", BASE_DIR / "warbridge.db"))
 APP_ENV = os.getenv("WARBRIDGE_ENV", "production").strip().lower()
 
 app = Flask(__name__)
@@ -109,15 +106,12 @@ def utcnow():
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE, timeout=10)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
-        g.db.execute("PRAGMA busy_timeout = 10000")
+        g.db = connect_database()
     return g.db
 
 
 def ensure_column(db, table, column, definition):
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    columns = db.table_columns(table)
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
@@ -155,7 +149,6 @@ def security_headers(response):
 
 
 def init_db():
-    DATABASE.parent.mkdir(parents=True, exist_ok=True)
     db = get_db()
     db.executescript(
         """
@@ -186,6 +179,21 @@ def init_db():
             closed INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS accommodations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id INTEGER NOT NULL REFERENCES users(id),
+            city TEXT NOT NULL,
+            area TEXT NOT NULL,
+            address TEXT,
+            rooms INTEGER NOT NULL,
+            rooms_available INTEGER NOT NULL DEFAULT 0,
+            women_only INTEGER NOT NULL DEFAULT 0,
+            description TEXT,
+            verified INTEGER NOT NULL DEFAULT 0,
+            blocked INTEGER NOT NULL DEFAULT 0,
+            closed INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS help_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             requester_id INTEGER REFERENCES users(id),
@@ -205,21 +213,6 @@ def init_db():
             escalated_at TEXT,
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS accommodations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            host_id INTEGER NOT NULL REFERENCES users(id),
-            city TEXT NOT NULL,
-            area TEXT NOT NULL,
-            address TEXT,
-            rooms INTEGER NOT NULL,
-            rooms_available INTEGER NOT NULL DEFAULT 0,
-            women_only INTEGER NOT NULL DEFAULT 0,
-            description TEXT,
-            verified INTEGER NOT NULL DEFAULT 0,
-            blocked INTEGER NOT NULL DEFAULT 0,
-            closed INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,7 +275,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scope TEXT NOT NULL,
             key_hash TEXT NOT NULL,
-            attempted_at REAL NOT NULL
+            attempted_at DOUBLE PRECISION NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_rate_limit_events_scope_key_time
             ON rate_limit_events(scope, key_hash, attempted_at);
@@ -293,8 +286,13 @@ def init_db():
         """
     )
     current_version = db.execute("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations").fetchone()["version"]
+    if current_version < 3:
+        db.execute("BEGIN IMMEDIATE")
+        current_version = db.execute(
+            "SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations"
+        ).fetchone()["version"]
     if current_version < 1:
-        accommodation_columns = {row["name"] for row in db.execute("PRAGMA table_info(accommodations)")}
+        accommodation_columns = db.table_columns("accommodations")
         if "rooms_available" not in accommodation_columns:
             ensure_column(db, "accommodations", "rooms_available", "INTEGER NOT NULL DEFAULT 0")
             db.execute("UPDATE accommodations SET rooms_available=rooms")
@@ -309,6 +307,21 @@ def init_db():
         ensure_column(db, "services", "closed", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(db, "alerts", "archived", "INTEGER NOT NULL DEFAULT 0")
         db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)", (utcnow(),))
+        current_version = 2
+    if current_version < 3:
+        db.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            CREATE INDEX IF NOT EXISTS idx_help_requests_status ON help_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_help_requests_sos_status ON help_requests(is_sos,status);
+            CREATE INDEX IF NOT EXISTS idx_shelters_verification_block ON shelters(verified,blocked);
+            CREATE INDEX IF NOT EXISTS idx_accommodations_verification_block ON accommodations(verified,blocked);
+            CREATE INDEX IF NOT EXISTS idx_services_verification_block ON services(verified,blocked);
+            CREATE INDEX IF NOT EXISTS idx_alerts_expires_at ON alerts(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
+            """
+        )
+        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (utcnow(),))
     db.commit()
 
     admin_email = os.getenv("WARBRIDGE_ADMIN_EMAIL")
@@ -942,7 +955,10 @@ def restore_request_capacity(db, row):
     elif row["status"] == "Accepted" and row["accommodation_id"]:
         db.execute(
             """UPDATE accommodations
-               SET rooms_available=MIN(rooms,rooms_available+1),updated_at=?
+               SET rooms_available=CASE
+                       WHEN rooms_available < rooms THEN rooms_available+1
+                       ELSE rooms
+                   END,updated_at=?
                WHERE id=?""",
             (utcnow(), row["accommodation_id"]),
         )
@@ -1379,7 +1395,7 @@ def create_report(user):
             "INSERT INTO reports(reporter_id,listing_type,listing_id,reason,status,updated_at,created_at) VALUES(?,?,?,?, 'Open', ?, ?)",
             (user["id"], listing_type, listing_id, reason[:1000], utcnow(), utcnow()),
         )
-    except sqlite3.IntegrityError:
+    except DatabaseIntegrityError:
         db.rollback()
         return jsonify({"error": "You have already reported this listing"}), 409
     audit_and_commit(db, user["id"], "listing_reported", listing_type, listing_id)

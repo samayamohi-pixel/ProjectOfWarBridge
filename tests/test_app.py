@@ -15,7 +15,7 @@ os.environ["WARBRIDGE_DB"] = db_path
 os.environ["SECRET_KEY"] = "test-secret"
 os.environ["WARBRIDGE_ENV"] = "test"
 
-from app import app, get_db, normalize_origin, utcnow
+from app import app, get_db, init_db, normalize_origin, utcnow
 from werkzeug.security import generate_password_hash
 
 
@@ -61,6 +61,22 @@ class WarBridgeApiTests(unittest.TestCase):
     def test_public_resources_are_available(self):
         self.assertEqual(self.client.get("/api/public/alerts").status_code, 200)
         self.assertEqual(self.client.get("/api/public/shelters").status_code, 200)
+
+    def test_schema_migrations_preserve_existing_users(self):
+        user_id = self.create_user("DISPLACED")
+        with app.app_context():
+            init_db()
+            db = get_db()
+            self.assertEqual(
+                db.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()["id"],
+                user_id,
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT MAX(version) AS version FROM schema_migrations"
+                ).fetchone()["version"],
+                3,
+            )
 
     def test_admin_analytics_requires_admin_role(self):
         self.assertEqual(self.client.get("/api/admin/analytics").status_code, 401)

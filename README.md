@@ -1,6 +1,6 @@
 # WarBridge
 
-A responsive React + Vite frontend with a Flask + SQLite backend implementing the WarBridge workflow.
+A responsive React + Vite frontend with a Flask backend implementing the WarBridge workflow. SQLite is the default for local demos; PostgreSQL is supported for hosted deployments.
 
 ## Run locally
 
@@ -55,14 +55,46 @@ Production startup requires a private `SECRET_KEY` of at least 32 characters and
 WARBRIDGE_ENV=production SECRET_KEY="<private-random-value>" HTTPS_ONLY=1 gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
 ```
 
-SQLite is intended for local development and small pilots. The app applies versioned schema migrations on startup and uses database-backed rate limits and atomic capacity transactions. The backup utility makes a consistent SQLite copy, runs `PRAGMA integrity_check`, and supports a restore that first preserves the current database:
+### Database configuration
+
+SQLite remains the default for local development and demo data. For PostgreSQL, install the backend requirements and configure a PostgreSQL connection URL. The app creates missing tables and applies additive, versioned schema migrations at startup; current data is retained, and migration version 3 adds query indexes.
+
+Development can use either SQLite or PostgreSQL:
+
+```powershell
+# SQLite (default)
+$env:WARBRIDGE_ENV = "development"
+$env:WARBRIDGE_DB = ".\warbridge-demo.db"
+
+# Or PostgreSQL
+$env:WARBRIDGE_ENV = "development"
+$env:WARBRIDGE_DEVELOPMENT_DATABASE_URL = "postgresql://warbridge:password@localhost:5432/warbridge_dev"
+$env:WARBRIDGE_DB_POOL_SIZE = "5"
+$env:WARBRIDGE_DB_CONNECTION_TIMEOUT = "10"
+```
+
+In production, set `WARBRIDGE_DATABASE_URL` (or `DATABASE_URL`) to the PostgreSQL URL. In tests, only `WARBRIDGE_TEST_DATABASE_URL` is used for PostgreSQL, and it is rejected if it matches the production URL. Without a PostgreSQL URL, the app uses SQLite at `WARBRIDGE_DB` or `warbridge.db`.
+
+To preserve records when moving an existing SQLite demo database to a new, empty PostgreSQL database, set the PostgreSQL target URL and run the importer before switching the application over:
+
+```powershell
+$env:WARBRIDGE_ENV = "production"
+$env:SECRET_KEY = "<private-random-value-at-least-32-characters>"
+$env:HTTPS_ONLY = "1"
+$env:WARBRIDGE_DATABASE_URL = "postgresql://warbridge:password@localhost:5432/warbridge"
+python migrate_sqlite_to_postgres.py --source .\warbridge-demo.db
+```
+
+The importer refuses to copy into tables that already contain records, preserves existing IDs and related records, and commits the copy as one transaction. Back up the source database first. Do not point the importer at a production target containing data.
+
+For SQLite, the backup utility makes a consistent copy, runs `PRAGMA integrity_check`, and supports a restore that first preserves the current database:
 
 ```powershell
 python db_backup.py --database .\warbridge.db backup --output D:\secure-backups\warbridge-20261126T001200Z.sqlite3
 python db_backup.py --database .\warbridge.db restore --input D:\secure-backups\warbridge-20261126T001200Z.sqlite3 --confirm-restore
 ```
 
-Stop the application before restoring. Backups contain sensitive contact and SOS data; store them only in access-controlled, encrypted storage and regularly test restores in an isolated environment. The included automated tests exercise backup and restore behavior, but do not validate a production storage provider.
+Stop the application before restoring. This utility is SQLite-only. For PostgreSQL, use the managed provider's backup and restore tooling or PostgreSQL-native backups. Backups contain sensitive contact and SOS data; store them only in access-controlled, encrypted storage and regularly test restores in an isolated environment. The included automated tests exercise SQLite backup and restore behavior, but do not validate a production storage provider.
 
 The health endpoints provide basic liveness/readiness checks; production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
 
