@@ -16,6 +16,8 @@ os.environ["SECRET_KEY"] = "test-secret"
 os.environ["WARBRIDGE_ENV"] = "test"
 
 from app import app, get_db, init_db, normalize_origin, utcnow
+from emergency_adapter import DevelopmentMockEmergencyNotificationProvider
+from verification_adapter import DevelopmentMockVerificationProvider
 from structured_logging import JsonLogFormatter
 from werkzeug.security import generate_password_hash
 
@@ -143,7 +145,7 @@ class WarBridgeApiTests(unittest.TestCase):
         response = self.client.get("/api/internal/metrics")
         self.assertEqual(response.status_code, 200)
         self.assertIn("warbridge_users_total", response.text)
-        self.assertIn("warbridge_database_schema_version 3", response.text)
+        self.assertIn("warbridge_database_schema_version 4", response.text)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_not_found_error_handler_returns_correlation_id(self):
@@ -159,7 +161,7 @@ class WarBridgeApiTests(unittest.TestCase):
     def test_sos_logs_exclude_private_submission_details(self):
         private_values = (
             "NeverLog Caller",
-            "private-phone-918273",
+            "555-0198",
             "private-location-Training-Address",
             "private-message-SOS-content",
         )
@@ -197,8 +199,148 @@ class WarBridgeApiTests(unittest.TestCase):
                 db.execute(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 ).fetchone()["version"],
-                3,
+                4,
             )
+
+    def test_partner_verification_records_states_notes_and_expiry(self):
+        partner_id = self.create_user("NGO", verified=False)
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+
+        review = self.client.post(
+            f"/api/admin/users/{partner_id}/review",
+            headers=self.csrf,
+            json={"review_notes": "Reviewing registration documents."},
+        )
+        self.assertEqual(review.status_code, 200)
+        self.assertEqual(review.get_json()["status"], "Under review")
+
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        approval = self.client.post(
+            f"/api/admin/users/{partner_id}/verify",
+            headers=self.csrf,
+            json={"review_notes": "Manual review completed.", "expires_at": expiry},
+        )
+        self.assertEqual(approval.status_code, 200)
+        with app.app_context():
+            partner = get_db().execute(
+                """SELECT verified,verification_status,verification_review_notes,
+                          verification_reviewed_at,verification_expires_at
+                   FROM users WHERE id=?""",
+                (partner_id,),
+            ).fetchone()
+        self.assertEqual(partner["verified"], 1)
+        self.assertEqual(partner["verification_status"], "Approved")
+        self.assertEqual(partner["verification_review_notes"], "Manual review completed.")
+        self.assertIsNotNone(partner["verification_reviewed_at"])
+        self.assertEqual(partner["verification_expires_at"], expiry)
+
+    def test_partner_can_submit_only_without_automatic_identity_approval(self):
+        partner_id = self.create_user("NGO", verified=False)
+        self.authenticate(partner_id)
+        disabled = self.client.post("/api/verification/submit", headers=self.csrf)
+        self.assertEqual(disabled.status_code, 503)
+
+        with patch("app.verification_provider", DevelopmentMockVerificationProvider()):
+            submitted = self.client.post("/api/verification/submit", headers=self.csrf)
+        self.assertEqual(submitted.status_code, 202)
+        self.assertEqual(submitted.get_json()["status"], "Submitted")
+        status = self.client.get("/api/verification/status").get_json()
+        self.assertEqual(status["status"], "Submitted")
+        with app.app_context():
+            saved_user = get_db().execute(
+                "SELECT verified,verification_submitted_at FROM users WHERE id=?",
+                (partner_id,),
+            ).fetchone()
+        self.assertEqual(saved_user["verified"], 0)
+        self.assertIsNotNone(saved_user["verification_submitted_at"])
+
+    def test_mock_sos_notifications_queue_only_configured_channels(self):
+        with patch.dict(os.environ, {"WARBRIDGE_EMERGENCY_SMS_RECIPIENT": "demo-recipient"}, clear=True):
+            with patch("app.emergency_notification_provider", DevelopmentMockEmergencyNotificationProvider()):
+                response = self.client.post(
+                    "/api/sos",
+                    headers=self.csrf,
+                    json={"phone": "555-0123"},
+                )
+        self.assertEqual(response.status_code, 201)
+        with app.app_context():
+            notifications = get_db().execute(
+                """SELECT channel,status,attempt_count FROM emergency_notifications
+                   WHERE request_id=?""",
+                (response.get_json()["id"],),
+            ).fetchall()
+        self.assertEqual(
+            [(row["channel"], row["status"], row["attempt_count"]) for row in notifications],
+            [("SMS", "Sent", 1)],
+        )
+
+    def test_expired_partner_verification_blocks_sos_handling(self):
+        partner_id = self.create_user("NGO")
+        expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with app.app_context():
+            get_db().execute(
+                "UPDATE users SET verification_expires_at=? WHERE id=?",
+                (expired, partner_id),
+            )
+            get_db().commit()
+        self.authenticate(partner_id)
+        self.assertEqual(self.client.get("/api/sos/incoming").status_code, 403)
+
+    def test_unclaimed_sos_is_escalated_after_timeout(self):
+        response = self.client.post(
+            "/api/sos",
+            headers=self.csrf,
+            json={"phone": "555-0123", "location": "Private test location"},
+        )
+        self.assertEqual(response.status_code, 201)
+        request_id = response.get_json()["id"]
+        with app.app_context():
+            get_db().execute(
+                "UPDATE help_requests SET created_at=? WHERE id=?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), request_id),
+            )
+            get_db().commit()
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        with patch("app.SOS_ESCALATION_TIMEOUT_SECONDS", 1):
+            items = self.client.get("/api/admin/sos").get_json()["requests"]
+        request_row = next(item for item in items if item["id"] == request_id)
+        self.assertEqual(request_row["status"], "Escalated")
+        self.assertEqual(request_row["location_text"], "Private test location")
+
+    def test_failed_notification_retry_is_admin_only_and_redacts_recipient(self):
+        sos_response = self.client.post(
+            "/api/sos",
+            headers=self.csrf,
+            json={"phone": "555-0123"},
+        )
+        request_id = sos_response.get_json()["id"]
+        with app.app_context():
+            notification_id = get_db().execute(
+                """INSERT INTO emergency_notifications(
+                       request_id,channel,status,attempt_count,created_at,updated_at
+                   ) VALUES(?,'SMS','Failed',1,?,?)""",
+                (request_id, utcnow(), utcnow()),
+            ).lastrowid
+            get_db().commit()
+        self.assertEqual(self.client.get("/api/admin/notifications/failed").status_code, 401)
+
+        admin_id = self.create_user("ADMIN")
+        self.authenticate(admin_id)
+        failure_list = self.client.get("/api/admin/notifications/failed").get_json()["notifications"]
+        self.assertEqual(failure_list[0]["id"], notification_id)
+        self.assertNotIn("recipient", failure_list[0])
+
+        with patch.dict(os.environ, {"WARBRIDGE_EMERGENCY_SMS_RECIPIENT": "private-destination"}):
+            with patch("app.emergency_notification_provider", DevelopmentMockEmergencyNotificationProvider()):
+                retried = self.client.post(
+                    f"/api/admin/notifications/{notification_id}/retry",
+                    headers=self.csrf,
+                )
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.get_json()["status"], "Sent")
+        self.assertNotIn("private-destination", retried.get_data(as_text=True))
 
     def test_admin_analytics_requires_admin_role(self):
         self.assertEqual(self.client.get("/api/admin/analytics").status_code, 401)
@@ -354,7 +496,7 @@ class WarBridgeApiTests(unittest.TestCase):
         result = self.client.post(
             "/api/auth/register",
             headers=self.csrf,
-            json={"name": "Helping Foundation", "email": "test@example.com", "password": "strongpass", "role": "NGO"},
+            json={"name": "Helping Foundation", "email": "test@example.com", "password": "strong-password-12", "role": "NGO"},
         )
         self.assertEqual(result.status_code, 200)
         self.assertNotIn("password_hash", result.get_json()["user"])
@@ -365,10 +507,56 @@ class WarBridgeApiTests(unittest.TestCase):
         login = self.client.post(
             "/api/auth/login",
             headers={"X-CSRF-Token": csrf},
-            json={"identity": "Helping Foundation", "password": "strongpass", "role": "NGO"},
+            json={"identity": "Helping Foundation", "password": "strong-password-12", "role": "NGO"},
         )
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.get_json()["user"]["role"], "NGO")
+
+    def test_registration_validates_email_and_password_length(self):
+        for email, password in (
+            ("invalid-email", "strong-password-12"),
+            ("person@example.test", "shortpass"),
+            ("person@example.test", "p" * 129),
+        ):
+            response = self.client.post(
+                "/api/auth/register",
+                headers=self.csrf,
+                json={"name": "Test user", "email": email, "password": password, "role": "DISPLACED"},
+            )
+            self.assertEqual(response.status_code, 400)
+
+    def test_request_body_size_limit_returns_json_error(self):
+        response = self.client.post(
+            "/api/auth/register",
+            data=b"x" * (app.config["MAX_CONTENT_LENGTH"] + 1),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.get_json()["error"], "Request too large")
+        self.assertIn("X-Request-ID", response.headers)
+
+    def test_sos_and_shelter_phone_numbers_are_validated(self):
+        invalid_sos = self.client.post(
+            "/api/sos",
+            headers=self.csrf,
+            json={"phone": "911"},
+        )
+        self.assertEqual(invalid_sos.status_code, 400)
+
+        ngo_id = self.create_user("NGO")
+        self.authenticate(ngo_id)
+        invalid_shelter = self.client.post(
+            "/api/shelters",
+            headers=self.csrf,
+            json={
+                "name": "Test Shelter",
+                "city": "Test City",
+                "area": "Test Area",
+                "beds_available": 1,
+                "phone": "not-a-phone",
+            },
+        )
+        self.assertEqual(invalid_shelter.status_code, 400)
 
     def test_role_scoped_admin_login_and_wrong_password(self):
         with app.app_context():

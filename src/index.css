@@ -701,3 +701,23 @@ h3 { font-size: 12px; font-weight: 650; letter-spacing: -.25px; }
   .analytics-periods { grid-template-columns: 1fr; }
   .analytics-state.analytics-error { align-items: flex-start; flex-direction: column; }
 }
+
+html[dir='rtl'] .landing-nav nav { margin-inline: auto; }
+html[dir='rtl'] .sidebar { border-right: 0; border-left: 1px solid rgba(var(--accent-rgb), .24); }
+html[dir='rtl'] .side-link { text-align: right; }
+html[dir='rtl'] .modal-close { right: auto; left: 16px; }
+html[dir='rtl'] .modal h2 { margin-right: 0; margin-left: 12px; }
+html[dir='rtl'] .modal-form label { text-align: right; }
+html[dir='rtl'] .analytics-state.analytics-error { text-align: right; }
+html[dir='rtl'] .chart-legend { padding-left: 0; padding-right: 15px; }
+html[dir='rtl'] .landing-nav nav button,
+html[dir='rtl'] .side-link,
+html[dir='rtl'] .request-info,
+html[dir='rtl'] .org-info,
+html[dir='rtl'] .listing,
+html[dir='rtl'] .admin-report { text-align: right; }
+html[dir='rtl'] .request-info strong i { margin-left: 0; margin-right: 5px; }
+html[dir='rtl'] .icon-arrow { transform: rotate(180deg); }
+html[dir='rtl'] input[type='tel'],
+html[dir='rtl'] input[type='email'],
+html[dir='rtl'] input[type='url'] { direction: ltr; text-align: right; }

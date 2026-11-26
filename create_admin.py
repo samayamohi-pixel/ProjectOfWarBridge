@@ -2,7 +2,7 @@ from getpass import getpass
 
 from werkzeug.security import generate_password_hash
 
-from app import app, get_db, init_db, utcnow
+from app import app, get_db, init_db, is_valid_email, utcnow
 
 
 def main():
@@ -11,8 +11,8 @@ def main():
     password = getpass("Password (minimum 12 characters): ")
     confirmation = getpass("Confirm password: ")
 
-    if not name or not email or len(password) < 12:
-        raise SystemExit("Username, email, and a password of at least 12 characters are required.")
+    if not name or not is_valid_email(email) or not 12 <= len(password) <= 128:
+        raise SystemExit("Enter a username, valid email, and password between 12 and 128 characters.")
     if password != confirmation:
         raise SystemExit("Passwords do not match.")
 

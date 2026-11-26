@@ -40,6 +40,8 @@ Displaced people, hosts, and NGOs can register through the sign-in form. Host an
 - `GET /api/public/shelters`, `GET /api/public/accommodations`, `GET /api/public/services`, `GET /api/public/alerts`
 - `POST /api/sos`, `GET /api/admin/sos`, `POST /api/requests`
 - Verified NGO SOS queue: `GET /api/sos/incoming`, `POST /api/sos/<id>/claim`, `POST /api/sos/<id>/escalate`, `POST /api/sos/<id>/resolve`
+- Partner verification: `GET /api/verification/status`, `POST /api/verification/submit`; Admin review/approval/rejection uses `/api/admin/users/<id>/review`, `/verify`, and `/reject`
+- Admin notification visibility and retry: `GET /api/admin/notifications/failed`, `POST /api/admin/notifications/<id>/retry`
 - NGO/host request handling; `POST /api/shelters`, `/api/accommodations`, `/api/services`, `GET /api/listings/mine`, `PATCH /api/listings/<type>/<id>`, and listing close/reopen actions
 - Alert create/edit/archive with expiry and type management; `POST /api/ratings` and `GET /api/ratings/mine` for completed shelter/host requests
 - Admin verification, listing moderation, reports, SOS monitoring, audit log, and Admin-only analytics via `GET /api/admin/analytics`
@@ -58,6 +60,7 @@ WARBRIDGE_ENV=production SECRET_KEY="<private-random-value>" HTTPS_ONLY=1 gunico
 ### Database configuration
 
 SQLite remains the default for local development and demo data. For PostgreSQL, install the backend requirements and configure a PostgreSQL connection URL. The app creates missing tables and applies additive, versioned schema migrations at startup; current data is retained, and migration version 3 adds query indexes.
+Migration version 4 adds partner verification review metadata and the provider-neutral emergency-notification queue without removing existing records.
 
 Development can use either SQLite or PostgreSQL:
 
@@ -137,7 +140,29 @@ The application writes JSON structured logs to stdout. Set `WARBRIDGE_LOG_LEVEL`
 
 Connect the JSON stdout stream and health/metrics endpoints to an external monitoring service such as your deployment platform's log collector and Prometheus-compatible scraper. Configure alerting for repeated database errors, non-2xx readiness checks, elevated 5xx responses, and unresolved SOS counts. Keep request-body and query-string logging disabled in proxies and monitoring agents as well; do not attach raw request/response payloads.
 
-Production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
+### Localization
+
+The language selector supports English, Hindi, and Arabic. English is the complete fallback resource. Hindi and Arabic resources are draft structures with missing entries falling back to English; they are not production-ready translations and require native-language and safeguarding review. Arabic sets the document direction to RTL and uses locale-aware number, date, and phone formatting. Review the rendered dashboards, dialogs, mobile layout, and right-to-left spacing after any translation changes.
+
+Run the focused localization checks and frontend type/build checks with:
+
+```powershell
+node --test tests/frontend-localization.test.mjs
+npx tsc --noEmit
+pnpm build
+```
+
+### Identity verification adapter
+
+New NGO/Host registrations enter `Submitted`; administrators can mark a case `Under review`, approve it with an optional expiry, or reject it with review notes. Review changes and expiry events are audited. `/api/verification/status` returns the signed-in partner's state, and `/api/verification/submit` is available only when a provider is configured. `WARBRIDGE_VERIFICATION_PROVIDER=mock` is development-only; the default is `disabled`. The mock records a submission only. It does not collect documents or verify identity. Approval remains a manual administrator decision, and expired approvals lose access to partner actions and public listings.
+
+### Emergency notification adapter
+
+The adapter exposes Email, SMS, WhatsApp, and push-notification channels and Queued, Sent, Failed, and Retried states. Notifications are queued only when a development mock is explicitly selected and a channel recipient is configured. Administrators can inspect failed delivery metadata at `GET /api/admin/notifications/failed` and retry eligible records at `POST /api/admin/notifications/<id>/retry`; recipient values and SOS details are never returned by that endpoint or written to structured logs. Retries use bounded exponential backoff. The development mock is not a real dispatch service and must not be used to claim that a person was contacted.
+
+`WARBRIDGE_SOS_ESCALATION_TIMEOUT_SECONDS` defaults to 900 seconds. The timeout is checked when an Admin or verified NGO opens the SOS queue; overdue unclaimed SOS records are marked escalated and become visible to administrators. This is not a continuously running scheduler and does not guarantee a response. Real email/SMS/WhatsApp/push delivery, credentials, recipient routing, monitoring, and a staffed response procedure must be selected and tested before any pilot. WarBridge is not an emergency service; call local emergency services when appropriate.
+
+Production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, locally reviewed emergency escalation procedures, native-language review, and a safeguarding/security review. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity.
 
 ### Embedded preview and session cookies
 
@@ -164,5 +189,31 @@ The Make environment already manages the preview server.
 - `pnpm build` — production frontend build
 - `pnpm format` — project formatter
 - `python -m unittest discover -s tests -v` — backend regression tests
+- `node --test tests/frontend-localization.test.mjs` — localization behavior and English-key coverage
+- `npx tsc --noEmit` — frontend type check
+
+Copy `.env.example` to a local, untracked environment file or set the variables in your shell. The sample contains placeholders only; do not commit a real secret or recipient address.
+
+## Demo and deployment checklists
+
+### College demo
+
+- Start the Flask API and Vite frontend with the development settings above.
+- Seed only the isolated demo database, then sign in using the temporary credentials printed by the seed command.
+- Walk through a displaced-user shelter/accommodation request, NGO or host acceptance, SOS claim/escalation/resolution, Admin verification and listing moderation, reports, ratings, analytics, and the audit log.
+- Confirm public listings exclude unverified/blocked owners and that SOS contact/location details remain hidden until claim or escalation.
+- Run backend tests, localization tests, TypeScript checking, and the frontend build before presenting.
+
+### Pilot or production
+
+- Choose a managed PostgreSQL provider, apply migrations, and test restore and rollback using a separate database before cutover.
+- Configure HTTPS, cookies, exact CORS/frame origin allowlists, secret storage, encrypted off-site backups, retention, health monitoring, metrics scraping, and alert routing.
+- Complete administrator/NGO onboarding, safeguarding review, privacy notice/consent/retention procedures, real verification-provider selection, and a staffed SOS response runbook.
+- Keep identity and emergency providers disabled until credentials, recipients, human ownership, and failure/retry behavior have been verified in a non-production environment.
+- Obtain native-language review for Hindi and Arabic; validate RTL layout on mobile and desktop.
+
+### Migration rollback
+
+Back up and verify the source database before deploying a schema migration. Migrations are additive and the application currently has no automatic schema downgrade. If startup or validation fails, restore the verified pre-deployment database snapshot to a separate database, redeploy the previous application version, and validate health, authentication, and listings before reconnecting traffic. Never test rollback by overwriting the live database.
 
 The background image is included at `public/warbridge-camp.png`; the app does not depend on an expiring generated-image URL.

@@ -68,7 +68,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 get_db().execute(
                     "SELECT MAX(version) AS version FROM schema_migrations"
                 ).fetchone()["version"],
-                3,
+                4,
             )
             indexes = {
                 row["indexname"]
@@ -86,6 +86,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     "idx_services_verification_block",
                     "idx_alerts_expires_at",
                     "idx_audit_log_created_at",
+                    "idx_notifications_request_status",
                 }.issubset(indexes)
             )
             get_db().commit()

@@ -13,6 +13,7 @@ TABLES = (
     "services",
     "alerts",
     "help_requests",
+    "emergency_notifications",
     "reports",
     "ratings",
     "audit_log",

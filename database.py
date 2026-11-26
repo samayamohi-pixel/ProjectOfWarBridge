@@ -93,6 +93,7 @@ class Database:
         "ratings",
         "audit_log",
         "rate_limit_events",
+        "emergency_notifications",
     }
 
     def __init__(self, connection, dialect, pool=None):
@@ -123,6 +124,7 @@ class Database:
                 cursor.execute(
                     """LOCK TABLE users, shelters, accommodations, services, alerts,
                        help_requests, reports, ratings, audit_log, rate_limit_events,
+                       emergency_notifications,
                        schema_migrations IN SHARE ROW EXCLUSIVE MODE"""
                 )
             except psycopg.Error as error:

@@ -14,11 +14,25 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from database import DatabaseIntegrityError, connect_database
+from emergency_adapter import (
+    NOTIFICATION_CHANNELS,
+    NOTIFICATION_STATES,
+    DisabledEmergencyNotificationProvider,
+    NotificationDispatchError,
+    NotificationResult,
+    ProviderDisabledError as NotificationProviderDisabledError,
+    create_emergency_notification_provider,
+)
 from structured_logging import JsonLogFormatter, LOG_LEVELS, REQUEST_ID_CONTEXT
+from verification_adapter import (
+    VERIFICATION_STATES,
+    ProviderDisabledError as VerificationProviderDisabledError,
+    create_verification_provider,
+)
 
 
 APP_ENV = os.getenv("WARBRIDGE_ENV", "production").strip().lower()
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 PROCESS_STARTED_AT = time.monotonic()
 REQUEST_ID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-"
@@ -31,10 +45,26 @@ API_ERROR_MESSAGES = {
     404: "Not found",
     409: "Conflict",
     429: "Too many requests",
+    413: "Request too large",
     500: "Internal server error",
 }
+EMAIL_PATTERN = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
+    re.IGNORECASE,
+)
+PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9\s().-]*$")
 
 app = Flask(__name__)
+verification_provider = create_verification_provider(
+    os.getenv("WARBRIDGE_VERIFICATION_PROVIDER", "disabled").strip().lower(),
+    APP_ENV,
+)
+emergency_notification_provider = create_emergency_notification_provider(
+    os.getenv("WARBRIDGE_EMERGENCY_PROVIDER", "disabled").strip().lower(),
+    APP_ENV,
+)
 logger = logging.getLogger("warbridge")
 level_name = os.getenv("WARBRIDGE_LOG_LEVEL", "INFO").strip().upper()
 if level_name not in LOG_LEVELS:
@@ -52,6 +82,12 @@ logging.getLogger("werkzeug").disabled = True
 METRICS_TOKEN = os.getenv("WARBRIDGE_METRICS_TOKEN", "").strip() or None
 if METRICS_TOKEN and len(METRICS_TOKEN) < 32:
     raise RuntimeError("WARBRIDGE_METRICS_TOKEN must be at least 32 characters")
+try:
+    SOS_ESCALATION_TIMEOUT_SECONDS = int(os.getenv("WARBRIDGE_SOS_ESCALATION_TIMEOUT_SECONDS", "900"))
+except ValueError as error:
+    raise RuntimeError("WARBRIDGE_SOS_ESCALATION_TIMEOUT_SECONDS must be a positive integer") from error
+if SOS_ESCALATION_TIMEOUT_SECONDS < 1:
+    raise RuntimeError("WARBRIDGE_SOS_ESCALATION_TIMEOUT_SECONDS must be a positive integer")
 
 secret_key = os.getenv("SECRET_KEY")
 if not secret_key:
@@ -130,6 +166,13 @@ app.config.update(
     SESSION_COOKIE_SECURE=cookie_secure,
 )
 try:
+    MAX_CONTENT_LENGTH = int(os.getenv("WARBRIDGE_MAX_CONTENT_LENGTH", str(1024 * 1024)))
+except ValueError as error:
+    raise RuntimeError("WARBRIDGE_MAX_CONTENT_LENGTH must be a positive integer") from error
+if not 1 <= MAX_CONTENT_LENGTH <= 10 * 1024 * 1024:
+    raise RuntimeError("WARBRIDGE_MAX_CONTENT_LENGTH must be between 1 byte and 10 MiB")
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+try:
     trusted_proxy_count = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
 except ValueError as error:
     raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer") from error
@@ -141,6 +184,23 @@ if trusted_proxy_count:
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_valid_email(value):
+    return (
+        isinstance(value, str)
+        and len(value) <= 254
+        and EMAIL_PATTERN.fullmatch(value) is not None
+    )
+
+
+def is_valid_phone(value):
+    if value in (None, ""):
+        return True
+    if not isinstance(value, str) or len(value) > 40 or not PHONE_PATTERN.fullmatch(value):
+        return False
+    digits = sum(character.isdigit() for character in value)
+    return 7 <= digits <= 15
 
 
 def log_event(level, event, message, **fields):
@@ -279,6 +339,20 @@ def init_db():
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS emergency_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL REFERENCES help_requests(id),
+            channel TEXT NOT NULL CHECK(channel IN ('Email','SMS','WhatsApp','Push notification')),
+            status TEXT NOT NULL DEFAULT 'Queued' CHECK(status IN ('Queued','Sent','Failed','Retried')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            next_attempt_at TEXT,
+            last_attempt_at TEXT,
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(request_id,channel)
+        );
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             reporter_id INTEGER NOT NULL REFERENCES users(id),
@@ -351,7 +425,7 @@ def init_db():
         """
     )
     current_version = db.execute("SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations").fetchone()["version"]
-    if current_version < 3:
+    if current_version < CURRENT_SCHEMA_VERSION:
         db.execute("BEGIN IMMEDIATE")
         current_version = db.execute(
             "SELECT COALESCE(MAX(version),0) AS version FROM schema_migrations"
@@ -387,11 +461,38 @@ def init_db():
             """
         )
         db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (utcnow(),))
+        current_version = 3
+    if current_version < 4:
+        ensure_column(db, "users", "verification_status", "TEXT NOT NULL DEFAULT 'Not started'")
+        ensure_column(db, "users", "verification_review_notes", "TEXT")
+        ensure_column(db, "users", "verification_submitted_at", "TEXT")
+        ensure_column(db, "users", "verification_reviewed_at", "TEXT")
+        ensure_column(db, "users", "verification_expires_at", "TEXT")
+        db.execute(
+            """UPDATE users SET verification_status='Submitted',
+               verification_submitted_at=created_at
+               WHERE role IN ('HOST','NGO') AND verified=0
+                 AND verification_status='Not started'"""
+        )
+        db.execute(
+            """UPDATE users SET verification_status='Approved',
+               verification_reviewed_at=created_at
+               WHERE role IN ('HOST','NGO') AND verified=1
+                 AND verification_status='Not started'"""
+        )
+        db.executescript(
+            """CREATE INDEX IF NOT EXISTS idx_notifications_request_status
+               ON emergency_notifications(request_id,status);
+            """
+        )
+        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)", (utcnow(),))
     db.commit()
 
     admin_email = os.getenv("WARBRIDGE_ADMIN_EMAIL")
     admin_password = os.getenv("WARBRIDGE_ADMIN_PASSWORD")
     if admin_email and admin_password:
+        if not is_valid_email(admin_email.lower()) or not 12 <= len(admin_password) <= 128:
+            raise RuntimeError("WARBRIDGE_ADMIN_EMAIL must be valid and WARBRIDGE_ADMIN_PASSWORD must be 12-128 characters")
         existing = db.execute("SELECT id FROM users WHERE email = ?", (admin_email.lower(),)).fetchone()
         if not existing:
             db.execute(
@@ -446,7 +547,7 @@ def handle_http_error(error):
     )
 
 
-for error_status in (400, 401, 403, 404, 409, 429, 500):
+for error_status in (400, 401, 403, 404, 409, 413, 429, 500):
     app.register_error_handler(error_status, handle_http_error)
 
 
@@ -503,7 +604,12 @@ def role_required(*roles):
 
 
 def verified_required(user):
-    return user["role"] == "ADMIN" or bool(user["verified"])
+    if user["role"] == "ADMIN":
+        return True
+    if not user["verified"]:
+        return False
+    expires_at = user["verification_expires_at"]
+    return not expires_at or expires_at > utcnow()
 
 
 def audit(actor_id, action, target_type=None, target_id=None, detail=None):
@@ -544,6 +650,116 @@ def allow_rate_limited_attempt(scope, value, limit, window_seconds):
     )
     db.commit()
     return True
+
+
+def queue_configured_sos_notifications(request_id):
+    if isinstance(emergency_notification_provider, DisabledEmergencyNotificationProvider):
+        return
+    db = get_db()
+    now = utcnow()
+    for channel in NOTIFICATION_CHANNELS:
+        env_channel = channel.upper().replace(" ", "_")
+        recipient = os.getenv(f"WARBRIDGE_EMERGENCY_{env_channel}_RECIPIENT", "").strip()
+        if not recipient:
+            continue
+        db.execute(
+            """INSERT INTO emergency_notifications(request_id,channel,status,created_at,updated_at)
+               VALUES(?,?,'Queued',?,?) ON CONFLICT(request_id,channel) DO NOTHING""",
+            (request_id, channel, now, now),
+        )
+        notification = db.execute(
+            """SELECT id,request_id,channel,status,attempt_count
+               FROM emergency_notifications WHERE request_id=? AND channel=?""",
+            (request_id, channel),
+        ).fetchone()
+        db.commit()
+        if notification and notification["status"] == "Queued":
+            attempt_emergency_notification(notification, recipient)
+
+
+def attempt_emergency_notification(row, recipient, retry=False):
+    if isinstance(emergency_notification_provider, DisabledEmergencyNotificationProvider):
+        raise NotificationProviderDisabledError("Emergency notification provider is disabled")
+    db = get_db()
+    now = utcnow()
+    attempts = row["attempt_count"] + 1
+    in_progress_status = "Retried" if retry else "Queued"
+    db.execute(
+        """UPDATE emergency_notifications SET status=?,attempt_count=?,last_attempt_at=?,
+           updated_at=? WHERE id=?""",
+        (in_progress_status, attempts, now, now, row["id"]),
+    )
+    db.commit()
+    try:
+        result = emergency_notification_provider.send(row["channel"], recipient, row["request_id"])
+    except NotificationProviderDisabledError:
+        raise
+    except NotificationDispatchError as error:
+        result = NotificationResult(sent=False, error_code=error.error_code)
+    if result.sent:
+        status = "Sent"
+        error_code = None
+        sent_at = now
+        next_attempt_at = None
+    else:
+        status = "Retried" if retry else "Failed"
+        candidate = result.error_code or "delivery_failed"
+        error_code = candidate if re.fullmatch(r"[a-zA-Z0-9_-]{1,60}", candidate) else "delivery_failed"
+        sent_at = None
+        next_attempt_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=min(3600, 30 * (2 ** min(attempts - 1, 7))))
+        ).isoformat()
+    db.execute(
+        """UPDATE emergency_notifications SET status=?,last_error_code=?,sent_at=?,
+           next_attempt_at=?,updated_at=? WHERE id=?""",
+        (status, error_code, sent_at, next_attempt_at, utcnow(), row["id"]),
+    )
+    db.commit()
+    if status not in NOTIFICATION_STATES:
+        raise RuntimeError("Notification provider returned an unsupported status")
+    log_event(
+        logging.INFO if result.sent else logging.WARNING,
+        "emergency_notification_attempt",
+        "Emergency notification attempt completed",
+        target_type="emergency_notification",
+        target_id=row["id"],
+        channel=row["channel"],
+        outcome=status.lower(),
+        error_code=error_code,
+    )
+    return status
+
+
+def escalate_overdue_sos():
+    db = get_db()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=SOS_ESCALATION_TIMEOUT_SECONDS)
+    ).isoformat()
+    db.execute("BEGIN IMMEDIATE")
+    rows = db.execute(
+        """SELECT id FROM help_requests
+           WHERE is_sos=1 AND status='Pending' AND claimed_by IS NULL AND created_at<=?""",
+        (cutoff,),
+    ).fetchall()
+    now = utcnow()
+    for row in rows:
+        updated = db.execute(
+            """UPDATE help_requests SET status='Escalated',escalated_at=?,updated_at=?
+               WHERE id=? AND is_sos=1 AND status='Pending' AND claimed_by IS NULL""",
+            (now, now, row["id"]),
+        )
+        if updated.rowcount:
+            audit(None, "sos_escalated_timeout", "help_request", row["id"])
+            log_event(
+                logging.WARNING,
+                "sos_escalated_timeout",
+                "Unclaimed SOS escalated after its response timeout",
+                target_type="help_request",
+                target_id=row["id"],
+                outcome="escalated",
+            )
+    if rows:
+        db.commit()
 
 
 def clear_rate_limited_attempts(scope, value):
@@ -593,13 +809,20 @@ def json_row(row):
 def public_user(user):
     if not user:
         return None
+    verification_status = user["verification_status"]
+    expires_at = user["verification_expires_at"]
+    is_verified = bool(user["verified"] and (not expires_at or expires_at > utcnow()))
+    if user["verified"] and not is_verified:
+        verification_status = "Expired"
     return {
         "id": user["id"],
         "name": user["name"],
         "email": user["email"],
         "role": user["role"],
         "gender": user["gender"],
-        "verified": bool(user["verified"]),
+        "verified": is_verified,
+        "verification_status": verification_status,
+        "verification_expires_at": expires_at,
     }
 
 
@@ -751,8 +974,8 @@ def register():
     password = str(data.get("password", ""))
     role = str(data.get("role", "")).upper()
     gender = str(data.get("gender", "")).strip() or None
-    if not name or not email or len(password) < 8:
-        return jsonify({"error": "Name, email and a password of at least 8 characters are required"}), 400
+    if not name or not is_valid_email(email) or not 12 <= len(password) <= 128:
+        return jsonify({"error": "Enter a valid email and a password between 12 and 128 characters"}), 400
     if role not in ("DISPLACED", "HOST", "NGO"):
         return jsonify({"error": "Role must be Displaced, Host or NGO"}), 400
     db = get_db()
@@ -767,6 +990,12 @@ def register():
         "INSERT INTO users(name,email,password_hash,role,gender,verified,blocked,created_at) VALUES(?,?,?,?,?,?,0,?)",
         (name, email, generate_password_hash(password), role, gender, 0, utcnow()),
     )
+    if role in ("HOST", "NGO"):
+        db.execute(
+            """UPDATE users SET verification_status='Submitted',
+               verification_submitted_at=? WHERE id=?""",
+            (utcnow(), cur.lastrowid),
+        )
     db.commit()
     session.clear()
     session["user_id"] = cur.lastrowid
@@ -860,6 +1089,44 @@ def me():
     return jsonify({"user": public_user(user)})
 
 
+@app.get("/api/verification/status")
+@role_required("HOST", "NGO")
+def verification_status(user):
+    status = public_user(user)
+    return jsonify({
+        "status": status["verification_status"],
+        "expires_at": status["verification_expires_at"],
+        "review_notes": user["verification_review_notes"],
+        "submitted_at": user["verification_submitted_at"],
+        "reviewed_at": user["verification_reviewed_at"],
+    })
+
+
+@app.post("/api/verification/submit")
+@role_required("HOST", "NGO")
+def submit_verification(user):
+    denied = require_csrf()
+    if denied:
+        return denied
+    if user["verified"] and verified_required(user):
+        return jsonify({"error": "This account is already verified"}), 409
+    try:
+        submission = verification_provider.submit(str(user["id"]))
+    except VerificationProviderDisabledError:
+        return jsonify({"error": "Identity verification provider is disabled; contact an administrator"}), 503
+    if submission.status not in VERIFICATION_STATES:
+        raise RuntimeError("Verification provider returned an unsupported status")
+    db = get_db()
+    now = utcnow()
+    db.execute(
+        """UPDATE users SET verification_status=?,verification_submitted_at=?,
+           verification_review_notes=NULL WHERE id=?""",
+        (submission.status, now, user["id"]),
+    )
+    audit_and_commit(db, user["id"], "partner_verification_submitted", "user", user["id"])
+    return jsonify({"status": submission.status}), 202
+
+
 @app.get("/api/public/alerts")
 def public_alerts():
     now = utcnow()
@@ -867,9 +1134,10 @@ def public_alerts():
         """SELECT a.*, u.name AS partner_name FROM alerts a
            JOIN users u ON u.id=a.ngo_id
            WHERE a.blocked=0 AND a.archived=0 AND u.verified=1 AND u.blocked=0
+             AND (u.verification_expires_at IS NULL OR u.verification_expires_at > ?)
              AND (a.expires_at IS NULL OR a.expires_at > ?)
            ORDER BY a.created_at DESC LIMIT 3""",
-        (now,),
+        (now, now),
     ).fetchall()
     return jsonify({"alerts": [json_row(row) for row in rows]})
 
@@ -879,8 +1147,9 @@ def public_shelters():
     city = request.args.get("city", "").strip()
     women_safe = request.args.get("women_safe") == "1"
     family_friendly = request.args.get("family_friendly") == "1"
-    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
-    params = []
+    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0",
+             "(u.verification_expires_at IS NULL OR u.verification_expires_at>?)"]
+    params = [utcnow()]
     if city:
         where.append("LOWER(s.city) LIKE LOWER(?)")
         params.append(f"%{city}%")
@@ -906,8 +1175,9 @@ def public_shelters():
 def public_services():
     city = request.args.get("city", "").strip()
     category = request.args.get("category", "").strip()
-    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0"]
-    params = []
+    where = ["s.blocked=0", "s.closed=0", "s.verified=1", "u.verified=1", "u.blocked=0",
+             "(u.verification_expires_at IS NULL OR u.verification_expires_at>?)"]
+    params = [utcnow()]
     if city:
         where.append("LOWER(city) LIKE LOWER(?)")
         params.append(f"%{city}%")
@@ -926,8 +1196,9 @@ def public_services():
 @app.get("/api/public/accommodations")
 def public_accommodations():
     city = request.args.get("city", "").strip()
-    where = ["a.blocked=0", "a.closed=0", "a.verified=1", "u.verified=1", "u.blocked=0", "a.rooms_available > 0"]
-    params = []
+    where = ["a.blocked=0", "a.closed=0", "a.verified=1", "u.verified=1", "u.blocked=0",
+             "a.rooms_available > 0", "(u.verification_expires_at IS NULL OR u.verification_expires_at>?)"]
+    params = [utcnow()]
     if city:
         where.append("LOWER(a.city) LIKE LOWER(?)")
         params.append(f"%{city}%")
@@ -948,6 +1219,9 @@ def create_sos():
     data = request.get_json(silent=True) or {}
     if data.get("website"):
         return jsonify({"ok": True})
+    phone = data.get("phone") or ""
+    if not is_valid_phone(phone):
+        return jsonify({"error": "Enter a valid phone number with 7 to 15 digits"}), 400
     ip = request.remote_addr or "unknown"
     if not allow_rate_limited_attempt("sos", ip, 3, 300):
         return jsonify({"error": "Too many SOS submissions. Please call 112 if this is an emergency."}), 429
@@ -958,7 +1232,7 @@ def create_sos():
         (
             str(data.get("message") or "")[:1000],
             str(data.get("name") or "")[:120],
-            str(data.get("phone") or "")[:40],
+            str(phone)[:40],
             str(data.get("location") or "")[:300],
             utcnow(),
             utcnow(),
@@ -972,6 +1246,7 @@ def create_sos():
         "help_request",
         cur.lastrowid,
     )
+    queue_configured_sos_notifications(cur.lastrowid)
     log_event(
         logging.INFO,
         "sos_created",
@@ -988,6 +1263,7 @@ def create_sos():
 def incoming_sos(user):
     if not verified_required(user):
         return jsonify({"error": "NGO verification required"}), 403
+    escalate_overdue_sos()
     rows = get_db().execute(
         """SELECT * FROM help_requests
            WHERE is_sos=1 AND status IN ('Pending','Accepted','Escalated')
@@ -1012,6 +1288,7 @@ def incoming_sos(user):
 @app.get("/api/admin/sos")
 @role_required("ADMIN")
 def admin_sos(user):
+    escalate_overdue_sos()
     db = get_db()
     rows = db.execute(
         """SELECT * FROM help_requests
@@ -1029,6 +1306,48 @@ def admin_sos(user):
             for row in rows
         ]
     })
+
+
+@app.get("/api/admin/notifications/failed")
+@role_required("ADMIN")
+def failed_emergency_notifications(user):
+    rows = get_db().execute(
+        """SELECT id,request_id,channel,status,attempt_count,last_error_code,
+                  next_attempt_at,last_attempt_at,created_at,updated_at
+           FROM emergency_notifications WHERE status IN ('Failed','Retried')
+           ORDER BY updated_at DESC"""
+    ).fetchall()
+    return jsonify({"notifications": [json_row(row) for row in rows]})
+
+
+@app.post("/api/admin/notifications/<int:notification_id>/retry")
+@role_required("ADMIN")
+def retry_emergency_notification(user, notification_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    db = get_db()
+    row = db.execute(
+        """SELECT id,request_id,channel,status,attempt_count,next_attempt_at
+           FROM emergency_notifications WHERE id=?""",
+        (notification_id,),
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "Notification not found"}), 404
+    if row["status"] not in ("Queued", "Failed", "Retried"):
+        return jsonify({"error": "Notification is not retryable"}), 409
+    channel_env = row["channel"].upper().replace(" ", "_")
+    recipient = os.getenv(f"WARBRIDGE_EMERGENCY_{channel_env}_RECIPIENT", "").strip()
+    if not recipient:
+        return jsonify({"error": "No recipient is configured for this notification channel"}), 503
+    if row["next_attempt_at"] and row["next_attempt_at"] > utcnow():
+        return jsonify({"error": "Notification retry is not due yet"}), 409
+    try:
+        status = attempt_emergency_notification(row, recipient, retry=row["attempt_count"] > 0)
+    except NotificationProviderDisabledError:
+        return jsonify({"error": "Emergency notification provider is disabled"}), 503
+    audit_and_commit(db, user["id"], "emergency_notification_retry", "emergency_notification", notification_id)
+    return jsonify({"status": status, "attempt_count": row["attempt_count"] + 1})
 
 
 @app.post("/api/sos/<int:request_id>/claim")
@@ -1149,8 +1468,9 @@ def create_request(user):
             return jsonify({"error": "A valid shelter ID is required"}), 400
         shelter = db.execute(
             """SELECT s.* FROM shelters s JOIN users u ON u.id=s.ngo_id
-               WHERE s.id=? AND u.verified=1 AND u.blocked=0""",
-            (shelter_id,),
+               WHERE s.id=? AND u.verified=1 AND u.blocked=0
+                 AND (u.verification_expires_at IS NULL OR u.verification_expires_at>?)""",
+            (shelter_id, utcnow()),
         ).fetchone()
         if not shelter or shelter["blocked"] or shelter["closed"] or not shelter["verified"]:
             return jsonify({"error": "Shelter is not available"}), 404
@@ -1167,8 +1487,9 @@ def create_request(user):
             return jsonify({"error": "A valid accommodation ID is required"}), 400
         accommodation = db.execute(
             """SELECT a.* FROM accommodations a JOIN users u ON u.id=a.host_id
-               WHERE a.id=? AND u.verified=1 AND u.blocked=0""",
-            (accommodation_id,),
+               WHERE a.id=? AND u.verified=1 AND u.blocked=0
+                 AND (u.verification_expires_at IS NULL OR u.verification_expires_at>?)""",
+            (accommodation_id, utcnow()),
         ).fetchone()
         if not accommodation or accommodation["blocked"] or not accommodation["verified"] or accommodation["closed"]:
             return jsonify({"error": "Accommodation is not available"}), 404
@@ -1360,18 +1681,21 @@ def create_shelter(user):
         return jsonify({"error": "NGO verification required"}), 403
     data = request.get_json(silent=True) or {}
     name, city, area = str(data.get("name", "")).strip(), str(data.get("city", "")).strip(), str(data.get("area", "")).strip()
+    phone = data.get("phone") or ""
     try:
         beds = int(data.get("beds_available", 0))
     except (TypeError, ValueError):
         return jsonify({"error": "beds_available must be a number"}), 400
     if not name or not city or not area or beds < 0:
         return jsonify({"error": "Name, city, area and non-negative bed count are required"}), 400
+    if not is_valid_phone(phone):
+        return jsonify({"error": "Enter a valid phone number with 7 to 15 digits"}), 400
     db = get_db()
     cur = db.execute(
         """INSERT INTO shelters(ngo_id,name,city,area,address,phone,beds_available,women_safe,family_friendly,verified,blocked,updated_at)
            VALUES(?,?,?,?,?,?,?,?,?,0,0,?)""",
         (user["id"], name, city, area, str(data.get("address", ""))[:300],
-         str(data.get("phone", ""))[:40], beds, int(bool(data.get("women_safe"))),
+         str(phone)[:40], beds, int(bool(data.get("women_safe"))),
          int(bool(data.get("family_friendly"))), utcnow()),
     )
     audit_and_commit(db, user["id"], "shelter_created", "shelter", cur.lastrowid)
@@ -1522,6 +1846,8 @@ def update_listing(user, listing_type, listing_id):
             value = str(data[field]).strip()
             if field in ("name", "city", "area", "category") and not value:
                 return jsonify({"error": f"{field} cannot be empty"}), 400
+            if field == "phone" and not is_valid_phone(value):
+                return jsonify({"error": "Enter a valid phone number with 7 to 15 digits"}), 400
             if field == "category" and value not in ("Food", "Healthcare", "Medical", "Legal", "Transport", "Other"):
                 return jsonify({"error": "Unsupported service category"}), 400
             fields[field] = value[:limit]
@@ -1783,8 +2109,30 @@ def my_ratings(user):
 @app.get("/api/admin/verifications")
 @role_required("ADMIN")
 def admin_verifications(user):
+    db = get_db()
+    now = utcnow()
+    expired = db.execute(
+        """SELECT id FROM users WHERE role IN ('HOST','NGO') AND verified=1
+           AND verification_expires_at IS NOT NULL AND verification_expires_at<=?
+           AND verification_status='Approved'""",
+        (now,),
+    ).fetchall()
+    for row in expired:
+        db.execute(
+            "UPDATE users SET verified=0,verification_status='Expired' WHERE id=?",
+            (row["id"],),
+        )
+        audit(user["id"], "partner_verification_expired", "user", row["id"])
+    if expired:
+        db.commit()
     rows = get_db().execute(
-        "SELECT id,name,email,role,verified,created_at FROM users WHERE role IN ('HOST','NGO') AND verified=0 AND blocked=0 ORDER BY created_at DESC"
+        """SELECT id,name,email,role,verified,verification_status,
+                  verification_review_notes,verification_submitted_at,
+                  verification_reviewed_at,verification_expires_at,created_at
+           FROM users
+           WHERE role IN ('HOST','NGO') AND blocked=0
+             AND verified=0
+           ORDER BY created_at DESC""",
     ).fetchall()
     return jsonify({"users": [json_row(row) for row in rows]})
 
@@ -2018,9 +2366,54 @@ def verify_user(user, user_id):
     target = db.execute("SELECT * FROM users WHERE id=? AND role IN ('HOST','NGO')", (user_id,)).fetchone()
     if not target:
         return jsonify({"error": "Partner not found"}), 404
-    db.execute("UPDATE users SET verified=1 WHERE id=?", (user_id,))
-    audit_and_commit(db, user["id"], "partner_verified", "user", user_id)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or set(data) - {"review_notes", "expires_at"}:
+        return jsonify({"error": "Only review_notes and expires_at are allowed"}), 400
+    notes = str(data.get("review_notes") or "").strip() or None
+    if notes and len(notes) > 1000:
+        return jsonify({"error": "Review notes must be 1000 characters or fewer"}), 400
+    expires_at = parse_expiry(data.get("expires_at"))
+    if expires_at is False:
+        return jsonify({"error": "expires_at must be a valid ISO-8601 timestamp with a timezone"}), 400
+    if expires_at and datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+        return jsonify({"error": "expires_at must be in the future"}), 400
+    reviewed_at = utcnow()
+    db.execute(
+        """UPDATE users SET verified=1,verification_status='Approved',
+           verification_review_notes=?,verification_reviewed_at=?,
+           verification_expires_at=? WHERE id=?""",
+        (notes, reviewed_at, expires_at, user_id),
+    )
+    audit_and_commit(db, user["id"], "partner_verified", "user", user_id, notes)
     return jsonify({"ok": True})
+
+
+@app.post("/api/admin/users/<int:user_id>/review")
+@role_required("ADMIN")
+def review_user_verification(user, user_id):
+    denied = require_csrf()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or set(data) - {"review_notes"}:
+        return jsonify({"error": "Only review_notes is allowed"}), 400
+    notes = str(data.get("review_notes") or "").strip() or None
+    if notes and len(notes) > 1000:
+        return jsonify({"error": "Review notes must be 1000 characters or fewer"}), 400
+    db = get_db()
+    target = db.execute(
+        "SELECT id FROM users WHERE id=? AND role IN ('HOST','NGO') AND verified=0 AND blocked=0",
+        (user_id,),
+    ).fetchone()
+    if not target:
+        return jsonify({"error": "Pending partner not found"}), 404
+    db.execute(
+        """UPDATE users SET verification_status='Under review',
+           verification_review_notes=? WHERE id=?""",
+        (notes, user_id),
+    )
+    audit_and_commit(db, user["id"], "partner_verification_review_started", "user", user_id, notes)
+    return jsonify({"ok": True, "status": "Under review"})
 
 
 @app.post("/api/admin/users/<int:user_id>/reject")
@@ -2036,8 +2429,18 @@ def reject_user(user, user_id):
     ).fetchone()
     if not target:
         return jsonify({"error": "Pending partner not found"}), 404
-    db.execute("UPDATE users SET blocked=1 WHERE id=?", (user_id,))
-    audit_and_commit(db, user["id"], "partner_rejected", "user", user_id)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or set(data) - {"review_notes"}:
+        return jsonify({"error": "Only review_notes is allowed"}), 400
+    notes = str(data.get("review_notes") or "").strip() or None
+    if notes and len(notes) > 1000:
+        return jsonify({"error": "Review notes must be 1000 characters or fewer"}), 400
+    db.execute(
+        """UPDATE users SET blocked=1,verification_status='Rejected',
+           verification_review_notes=?,verification_reviewed_at=? WHERE id=?""",
+        (notes, utcnow(), user_id),
+    )
+    audit_and_commit(db, user["id"], "partner_rejected", "user", user_id, notes)
     log_event(
         logging.WARNING,
         "account_blocked",
