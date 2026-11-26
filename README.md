@@ -87,14 +87,47 @@ python migrate_sqlite_to_postgres.py --source .\warbridge-demo.db
 
 The importer refuses to copy into tables that already contain records, preserves existing IDs and related records, and commits the copy as one transaction. Back up the source database first. Do not point the importer at a production target containing data.
 
-For SQLite, the backup utility makes a consistent copy, runs `PRAGMA integrity_check`, and supports a restore that first preserves the current database:
+### SQLite backups
+
+The backup utility creates timestamped SQLite snapshots, runs `PRAGMA integrity_check`, and verifies each archive by restoring it into an isolated temporary database. It supports authenticated AES-256-GCM encrypted output. Backups remain unencrypted unless `--encrypt` is passed.
+
+Configure the backup location, log file, and retention. Retention keeps backups within the configured age plus the newest configured count (defaults: 30 days and 14 files):
 
 ```powershell
-python db_backup.py --database .\warbridge.db backup --output D:\secure-backups\warbridge-20261126T001200Z.sqlite3
-python db_backup.py --database .\warbridge.db restore --input D:\secure-backups\warbridge-20261126T001200Z.sqlite3 --confirm-restore
+$env:WARBRIDGE_BACKUP_DIR = "D:\secure-backups"
+$env:WARBRIDGE_BACKUP_RETENTION_DAYS = "30"
+$env:WARBRIDGE_BACKUP_RETENTION_COUNT = "14"
+$env:WARBRIDGE_BACKUP_ENCRYPTION_KEY = "<URL-safe-base64-32-byte-key>"
+python db_backup.py backup --encrypt
 ```
 
-Stop the application before restoring. This utility is SQLite-only. For PostgreSQL, use the managed provider's backup and restore tooling or PostgreSQL-native backups. Backups contain sensitive contact and SOS data; store them only in access-controlled, encrypted storage and regularly test restores in an isolated environment. The included automated tests exercise SQLite backup and restore behavior, but do not validate a production storage provider.
+Generate a key once and store it outside the repository in a protected secret store; never put it in source control or beside the encrypted archives:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+The log defaults to `warbridge-backup.log` in the backup directory; override it with `WARBRIDGE_BACKUP_LOG`. To test an archive without changing the live database, run:
+
+```powershell
+python db_backup.py verify --input D:\secure-backups\warbridge-backup-20261126T001200Z.sqlite3.enc
+```
+
+The verifier decrypts when needed, restores into a temporary database, and checks its integrity. Encrypted archives require the same key used to create them; losing or rotating that key makes those archives unrecoverable.
+
+Schedule the one-shot `backup` command with the operating system scheduler so failures and process restarts are managed outside the web app. On Windows, create a daily Task Scheduler task that runs the project's `.venv\Scripts\python.exe` with arguments `db_backup.py backup --encrypt`, set the working directory to the project folder, and run it as the account that owns the backup configuration. On Linux, a cron entry can source a protected environment file:
+
+```cron
+15 2 * * * . /etc/warbridge/backup.env && cd /srv/warbridge && /srv/warbridge/.venv/bin/python db_backup.py backup --encrypt
+```
+
+Before restoring, stop the application and explicitly confirm replacement. The utility makes and verifies a timestamped safety copy of the current database before atomically installing the restored file:
+
+```powershell
+python db_backup.py --database .\warbridge.db restore --input D:\secure-backups\warbridge-backup-20261126T001200Z.sqlite3.enc --confirm-restore
+```
+
+The backup utility is SQLite-only and refuses to run when PostgreSQL is configured. For PostgreSQL, use the managed provider's backup/restore tooling or PostgreSQL-native backups. Backups contain sensitive contact and SOS data; encrypt them and store them only in access-controlled, off-site storage. The code prepares local encrypted archives but does not connect to a cloud backup provider.
 
 The health endpoints provide basic liveness/readiness checks; production still needs an external monitoring/alerting service, a supported shared database, encrypted off-site backup storage, and locally reviewed emergency escalation procedures. Partner approval is a manual administrative decision only: WarBridge does not collect identity documents or independently verify identity. The current interface is English-only; any translation requires selected target languages and human safeguarding review.
 
