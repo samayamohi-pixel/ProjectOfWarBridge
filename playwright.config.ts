@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { defineConfig } from '@playwright/test'
 
-const adminEmail = `e2e-admin-${randomUUID()}@example.test`
-const adminPassword = randomBytes(24).toString('base64url')
-const userPassword = randomBytes(24).toString('base64url')
+const adminEmail = process.env.WARBRIDGE_E2E_ADMIN_EMAIL ?? 'e2e-admin@example.test'
+const adminPassword = process.env.WARBRIDGE_E2E_ADMIN_PASSWORD ?? 'e2e-admin-password-local-only'
+const userPassword = process.env.WARBRIDGE_E2E_USER_PASSWORD ?? 'e2e-user-password-local-only'
 const databasePath = path.join(tmpdir(), `warbridge-e2e-${randomUUID()}.db`)
 const localPython = path.join(process.cwd(), '.venv', 'Scripts', 'python.exe')
 const python = process.env.PYTHON
